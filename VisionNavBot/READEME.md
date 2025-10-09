@@ -4,7 +4,7 @@ flowchart LR
   subgraph Inputs_Outputs["Inputs / Outputs"]
     Cam["Camera"]
     User["User Command"]
-    Servos["Left/Right Servos"]
+    Servos["3x Servos (Omniverse 3-Wheel Base)"]
   end
 
   subgraph Core["VisionNavBot Core"]
