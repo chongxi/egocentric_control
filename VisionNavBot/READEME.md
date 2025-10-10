@@ -67,3 +67,39 @@ flowchart LR
   CTR --> IORobot
   IORobot --> Servos
 ```
+
+
+
+```mermaid
+sequenceDiagram
+  %% ===== Command-to-Action Loop =====
+  participant U as User
+  participant L as language.py
+  participant S as slam.py
+  participant P as perception.py
+  participant M as mapping.py
+  participant G as planner.py
+  participant C as controller.py
+  participant R as io_robot.py
+
+  U->>L: "move to black chair/ defined coordinates"
+  L-->>G: goal = {cls:"chair", color:"black"} or place
+
+  loop Control Loop (10–20 Hz)
+    P->>P: detect objects & freespace
+    P-->>M: detections, freespace
+    S-->>M: pose (x,y,θ)
+    M-->>G: costmap, landmarks, places
+    S-->>G: current pose
+
+    alt have goal pose
+      G-->>G: global path (A*) + local target
+    else need search
+      G-->>G: spin/explore to locate target
+    end
+
+    G-->>C: (vx, vy, ω)
+    C-->>R: PWM (wheel1, wheel2, wheel3)
+  end
+
+```
