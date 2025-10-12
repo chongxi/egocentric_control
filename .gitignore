@@ -223,3 +223,6 @@ slam/video
 
 checkpoints/
 .claude/
+video/
+scan_20251009_155543_tum/
+scan_20251009_155543_frames/
