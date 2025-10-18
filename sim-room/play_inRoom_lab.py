@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import sys
 import traceback
 from isaaclab.app import AppLauncher
 
@@ -41,7 +42,14 @@ simulation_app = app_launcher.app
 import isaaclab.sim as sim_utils  # noqa: E402
 from isaaclab.assets import AssetBaseCfg  # noqa: E402
 from isaaclab.assets.articulation import ArticulationCfg  # noqa: E402
+from isaaclab.actuators import ImplicitActuatorCfg  # noqa: E402
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg  # noqa: E402
+import omni.appwindow  # noqa: E402
+import torch  # noqa: E402
+
+# Add src to path for shared modules
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+from base_controller import OmniBaseController  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Scene configuration
@@ -63,7 +71,15 @@ ROOM_CFG = AssetBaseCfg(
 
 ROBOT_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(usd_path=ROBOT_USD_PATH),
-    actuators={},  # No actuators needed for passive/kinematic viewing
+    actuators={
+        "wheels": ImplicitActuatorCfg(
+            joint_names_expr=["axle_0_joint", "axle_1_joint", "axle_2_joint"],
+            velocity_limit=100.0,
+            effort_limit=10000.0,
+            stiffness=None,  # Use None to let USD settings take precedence
+            damping=None,    # Use None to let USD settings take precedence
+        ),
+    },
 ).replace(prim_path="{ENV_REGEX_NS}/XLERobot")  # Robot inside env_0, parallel to Room
 
 
@@ -137,31 +153,93 @@ def main() -> None:
     print("\n[play_xle_room] Assets loaded. Isaac Lab simulation running.")
     print("  Room USD:  ", ROOM_USD_PATH)
     print("  Robot USD: ", ROBOT_USD_PATH)
+
+    # Setup keyboard control
+    print("[play_xle_room] Setting up keyboard control...")
+    base_controller = OmniBaseController(base_speed=10.0, verbose=True)
+    appwindow = omni.appwindow.get_default_app_window()
+    if appwindow and base_controller.setup_keyboard(appwindow):
+        print("[play_xle_room] ✓ Keyboard control enabled")
+    else:
+        print("[play_xle_room] ⚠ Keyboard control unavailable (headless mode)")
+
     print("Close the Isaac Lab window or press Ctrl+C to exit.\n")
 
     sim_dt = sim.get_physics_dt()
     frame = 0
 
+    # Get device for tensor operations
+    device = sim.device
+
+    # Find the joint indices for the wheel joints
+    robot_joint_names = scene["robot"].data.joint_names
+    wheel_joint_names = ["axle_0_joint", "axle_1_joint", "axle_2_joint"]
+    wheel_joint_indices = []
+    for wheel_name in wheel_joint_names:
+        try:
+            idx = robot_joint_names.index(wheel_name)
+            wheel_joint_indices.append(idx)
+        except ValueError:
+            print(f"[play_xle_room] Warning: Joint '{wheel_name}' not found in robot")
+
+    print(f"[play_xle_room] Robot joint names: {robot_joint_names}")
+    print(f"[play_xle_room] Wheel joint indices: {wheel_joint_indices}")
+    print(f"[play_xle_room] Number of actuated joints: {scene['robot'].num_joints}")
+
+    # Check if actuators are configured
+    if hasattr(scene["robot"], 'actuators'):
+        print(f"[play_xle_room] Robot actuators: {scene['robot'].actuators}")
+        for name, actuator in scene["robot"].actuators.items():
+            print(f"[play_xle_room]   - {name}: {actuator.joint_names}")
+    else:
+        print(f"[play_xle_room] WARNING: Robot has no actuators configured!")
+
     # Ensure initial update to show the window
     simulation_app.update()
     print("[play_xle_room] Window should now be visible. Starting simulation loop...")
 
-    while simulation_app.is_running():
-        # Write scene data (includes both room and robot)
-        scene.write_data_to_sim()
+    try:
+        while simulation_app.is_running():
+            # Get wheel velocities from keyboard control
+            wheel_velocities = base_controller.get_wheel_velocities(device=device)
 
-        # Step physics
-        sim.step()
+            # Apply velocities to robot wheels using Isaac Lab articulation API
+            # The robot has 3 wheel joints: axle_0_joint, axle_1_joint, axle_2_joint
+            if len(wheel_joint_indices) == 3:
+                # Set joint velocity targets for the 3 wheel joints
+                # wheel_velocities is shape [3] for the 3 wheels
+                joint_vel_target = wheel_velocities.unsqueeze(0)  # Shape: [1, 3] for batch dimension
+                scene["robot"].set_joint_velocity_target(joint_vel_target, joint_ids=wheel_joint_indices)
 
-        # Update scene (includes both room and robot)
-        scene.update(sim_dt)
+                # Debug: Check if the target was set correctly
+                if frame % 60 == 0 and torch.any(wheel_velocities != 0):
+                    print(f"[Debug Frame {frame}] Set velocity target: {joint_vel_target.cpu().numpy()}")
+                    print(f"[Debug Frame {frame}] Current joint velocities: {scene['robot'].data.joint_vel[0, wheel_joint_indices].cpu().numpy()}")
 
-        # Update viewer
-        simulation_app.update()
+            # Write scene data (includes both room and robot)
+            scene.write_data_to_sim()
 
-        frame += 1
-        if frame % 120 == 0:
-            print(f"[play_xle_room] Running... ({frame} frames)")
+            # Step physics
+            sim.step()
+
+            # Update scene (includes both room and robot)
+            scene.update(sim_dt)
+
+            # Update viewer
+            simulation_app.update()
+
+            frame += 1
+
+            # Debug output
+            base_controller.print_debug_info(frame, wheel_velocities)
+
+            if frame % 120 == 0:
+                print(f"[play_xle_room] Running... ({frame} frames)")
+
+    except KeyboardInterrupt:
+        print("\n[play_xle_room] Interrupted by user")
+    finally:
+        base_controller.cleanup()
 
 
 if __name__ == "__main__":
