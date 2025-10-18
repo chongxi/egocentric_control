@@ -7,6 +7,8 @@ import math
 import os
 import sys
 import traceback
+from typing import Optional, Sequence, Union
+
 from isaaclab.app import AppLauncher
 
 
@@ -45,11 +47,14 @@ from isaaclab.assets.articulation import ArticulationCfg  # noqa: E402
 from isaaclab.actuators import ImplicitActuatorCfg  # noqa: E402
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg  # noqa: E402
 import omni.appwindow  # noqa: E402
+import omni.usd  # noqa: E402
 import torch  # noqa: E402
+from pxr import UsdGeom  # noqa: E402
 
 # Add src to path for shared modules
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 from base_controller import OmniBaseController  # noqa: E402
+from xlerobot_dual_arm_ik import DualArmIKSolver  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Scene configuration
@@ -62,6 +67,10 @@ CAMERA_EYE = (3.0, 2.0, 2.0)
 CAMERA_TARGET = (0.0, 0.0, 1.0)
 ROBOT_POS = (0.0, 0.0, 0.0)
 ROOM_POS = (0.0, 0.0, 0.0)
+TARGET_VISIBLE = False
+TARGET_RADIUS = 0.05
+TARGET_RIGHT_INIT = (0.45, 0.35, 1.1)
+TARGET_LEFT_INIT = (0.45, -0.35, 1.1)
 
 ROOM_CFG = AssetBaseCfg(
     prim_path="{ENV_REGEX_NS}/Room",  # Room inside env_0
@@ -79,8 +88,36 @@ ROBOT_CFG = ArticulationCfg(
             stiffness=None,  # Use None to let USD settings take precedence
             damping=None,    # Use None to let USD settings take precedence
         ),
+        "arm_joints": ImplicitActuatorCfg(
+            joint_names_expr=[
+                "Rotation", "Pitch", "Elbow", "Wrist_Pitch", "Wrist_Roll",
+                "Rotation_2", "Pitch_2", "Elbow_2", "Wrist_Pitch_2", "Wrist_Roll_2",
+            ],
+            damping=0.0,
+            stiffness=1000.0,
+        ),
     },
 ).replace(prim_path="{ENV_REGEX_NS}/XLERobot")  # Robot inside env_0, parallel to Room
+
+TARGET_RIGHT_CFG = AssetBaseCfg(
+    prim_path="{ENV_REGEX_NS}/TargetRight",
+    spawn=sim_utils.SphereCfg(
+        radius=TARGET_RADIUS,
+        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.3, 0.3)),
+        rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True, disable_gravity=True),
+    ),
+    init_state=AssetBaseCfg.InitialStateCfg(pos=TARGET_RIGHT_INIT),
+)
+
+TARGET_LEFT_CFG = AssetBaseCfg(
+    prim_path="{ENV_REGEX_NS}/TargetLeft",
+    spawn=sim_utils.SphereCfg(
+        radius=TARGET_RADIUS,
+        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.3, 0.6, 1.0)),
+        rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True, disable_gravity=True),
+    ),
+    init_state=AssetBaseCfg.InitialStateCfg(pos=TARGET_LEFT_INIT),
+)
 
 
 def _yaw_to_quaternion(yaw_degrees: float) -> tuple[float, float, float, float]:
@@ -94,6 +131,49 @@ class XleRoomSceneCfg(InteractiveSceneCfg):
     # Room USD already contains ground plane and lighting, so we don't duplicate them
     room = ROOM_CFG
     robot = ROBOT_CFG
+    target_right = TARGET_RIGHT_CFG
+    target_left = TARGET_LEFT_CFG
+
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+
+def _set_prim_visibility(target: Union[str, Sequence[str], object], visible: bool, scene: Optional[InteractiveScene] = None) -> None:
+    """Toggle visibility for USD prims referenced by name, path, or asset."""
+
+    def _iter_paths(item: Union[str, Sequence[str], object]):
+        if isinstance(item, (list, tuple)):
+            for sub_item in item:
+                yield from _iter_paths(sub_item)
+        elif hasattr(item, "prim_paths"):
+            yield from _iter_paths(getattr(item, "prim_paths"))
+        elif isinstance(item, str):
+            if item.startswith("/"):
+                yield item
+            elif scene is not None:
+                try:
+                    asset = scene[item]
+                except KeyError:
+                    print(f"[WARN] Prim name not found in scene: {item}")
+                else:
+                    yield from _iter_paths(asset.prim_paths)
+            else:
+                print(f"[WARN] Cannot resolve prim name without scene: {item}")
+        else:
+            print(f"[WARN] Unsupported target for visibility toggle: {item}")
+
+    stage = omni.usd.get_context().get_stage()
+    for prim_path in _iter_paths(target):
+        prim = stage.GetPrimAtPath(prim_path)
+        if not prim or not prim.IsValid():
+            print(f"[WARN] Prim not found: {prim_path}")
+            continue
+        img = UsdGeom.Imageable(prim)
+        if visible:
+            img.MakeVisible()
+        else:
+            img.MakeInvisible()
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +230,10 @@ def main() -> None:
     scene.write_data_to_sim()
     print("[play_xle_room] Scene data written.")
 
+    print("[play_xle_room] Configuring IK target visibility...")
+    _set_prim_visibility(scene["target_left"], TARGET_VISIBLE, scene)
+    _set_prim_visibility(scene["target_right"], TARGET_VISIBLE, scene)
+
     print("\n[play_xle_room] Assets loaded. Isaac Lab simulation running.")
     print("  Room USD:  ", ROOM_USD_PATH)
     print("  Robot USD: ", ROBOT_USD_PATH)
@@ -170,6 +254,15 @@ def main() -> None:
 
     # Get device for tensor operations
     device = sim.device
+    print("[play_xle_room] Initializing dual-arm IK solver...")
+    ik_solver = DualArmIKSolver(
+        robot=scene["robot"],
+        left_target=scene["target_left"],
+        right_target=scene["target_right"],
+        device=device,
+    )
+    attach_cooldown = 0.0
+    was_moving = False
 
     # Find the joint indices for the wheel joints
     robot_joint_names = scene["robot"].data.joint_names
@@ -181,6 +274,9 @@ def main() -> None:
             wheel_joint_indices.append(idx)
         except ValueError:
             print(f"[play_xle_room] Warning: Joint '{wheel_name}' not found in robot")
+    wheel_joint_ids = None
+    if len(wheel_joint_indices) == 3:
+        wheel_joint_ids = torch.tensor(wheel_joint_indices, dtype=torch.long, device=device)
 
     print(f"[play_xle_room] Robot joint names: {robot_joint_names}")
     print(f"[play_xle_room] Wheel joint indices: {wheel_joint_indices}")
@@ -200,37 +296,41 @@ def main() -> None:
 
     try:
         while simulation_app.is_running():
+            base_moving = base_controller.is_moving()
+            if base_moving:
+                attach_cooldown = 0.5
+                was_moving = True
+            else:
+                attach_cooldown = max(0.0, attach_cooldown - sim_dt)
+                if was_moving and attach_cooldown == 0.0:
+                    ik_solver.reset()
+                    was_moving = False
+                    print("[play_xle_room] Base stopped - IK solver reset")
+
             # Get wheel velocities from keyboard control
             wheel_velocities = base_controller.get_wheel_velocities(device=device)
 
             # Apply velocities to robot wheels using Isaac Lab articulation API
-            # The robot has 3 wheel joints: axle_0_joint, axle_1_joint, axle_2_joint
-            if len(wheel_joint_indices) == 3:
-                # Set joint velocity targets for the 3 wheel joints
-                # wheel_velocities is shape [3] for the 3 wheels
+            if wheel_joint_ids is not None:
                 joint_vel_target = wheel_velocities.unsqueeze(0)  # Shape: [1, 3] for batch dimension
-                scene["robot"].set_joint_velocity_target(joint_vel_target, joint_ids=wheel_joint_indices)
+                scene["robot"].set_joint_velocity_target(joint_vel_target, joint_ids=wheel_joint_ids)
 
-                # Debug: Check if the target was set correctly
                 if frame % 60 == 0 and torch.any(wheel_velocities != 0):
                     print(f"[Debug Frame {frame}] Set velocity target: {joint_vel_target.cpu().numpy()}")
-                    print(f"[Debug Frame {frame}] Current joint velocities: {scene['robot'].data.joint_vel[0, wheel_joint_indices].cpu().numpy()}")
+                    current_vel = scene["robot"].data.joint_vel[0, wheel_joint_indices].cpu().numpy()
+                    print(f"[Debug Frame {frame}] Current joint velocities: {current_vel}")
 
-            # Write scene data (includes both room and robot)
+            if base_moving or attach_cooldown > 0.0:
+                ik_solver.sync_targets_to_current_pose()
+
+            ik_solver.step()
+
             scene.write_data_to_sim()
-
-            # Step physics
             sim.step()
-
-            # Update scene (includes both room and robot)
             scene.update(sim_dt)
-
-            # Update viewer
             simulation_app.update()
 
             frame += 1
-
-            # Debug output
             base_controller.print_debug_info(frame, wheel_velocities)
 
             if frame % 120 == 0:
