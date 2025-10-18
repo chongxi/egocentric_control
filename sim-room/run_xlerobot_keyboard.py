@@ -65,12 +65,18 @@ def _setup_keyboard_listener(active_keys: Set[str]):
     keyboard_device = app_window.get_keyboard()
 
     def _on_key_event(event, *_):
-        key_name = event.input.name
+        key_input = event.input
+        if isinstance(key_input, KeyboardInput):
+            key_name = key_input.name
+        elif hasattr(key_input, "name"):
+            key_name = key_input.name
+        else:
+            key_name = str(key_input).upper()
         if event.type == KeyboardEventType.KEY_PRESS or event.type == KeyboardEventType.KEY_REPEAT:
             active_keys.add(key_name)
         elif event.type == KeyboardEventType.KEY_RELEASE:
             active_keys.discard(key_name)
-        if event.type == KeyboardEventType.KEY_PRESS and event.input == KeyboardInput.ESCAPE:
+        if event.type == KeyboardEventType.KEY_PRESS and key_input == KeyboardInput.ESCAPE:
             simulation_app.close()
         return True
 
