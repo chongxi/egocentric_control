@@ -1,7 +1,7 @@
 import open3d as o3d
 import numpy as np
 
-ply_path = "mapper\points2.ply"
+ply_path = "mapper\points5.ply"
 
 # Load
 pcd = o3d.io.read_point_cloud(ply_path)
