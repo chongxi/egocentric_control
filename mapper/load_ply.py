@@ -1,7 +1,7 @@
 import open3d as o3d
 import numpy as np
 
-ply_path = "mapper\points.ply"
+ply_path = "mapper\points2.ply"
 
 # Load
 pcd = o3d.io.read_point_cloud(ply_path)
@@ -100,7 +100,8 @@ if 'plane' in locals():
     # Create UI panel on the right side
     em = window.theme.font_size
     panel_width = 20 * em
-    panel = o3d.visualization.gui.Vert(0.5 * em, o3d.visualization.gui.Margins(0.5 * em))
+    # Reduce spacing: changed from 0.5 * em to 0.2 * em for tighter layout
+    panel = o3d.visualization.gui.Vert(0.2 * em, o3d.visualization.gui.Margins(0.3 * em))
 
     # Title
     title_label = o3d.visualization.gui.Label("PLANE CONTROL PANEL")
@@ -115,7 +116,7 @@ if 'plane' in locals():
     panel.add_child(pos_y_label)
     panel.add_child(pos_z_label)
 
-    panel.add_fixed(0.5 * em)
+    panel.add_fixed(0.25 * em)
     panel.add_child(o3d.visualization.gui.Label("Rotation (deg):"))
     yaw_label = o3d.visualization.gui.Label("Yaw:   0.0")
     pitch_label = o3d.visualization.gui.Label("Pitch: 0.0")
@@ -124,7 +125,7 @@ if 'plane' in locals():
     panel.add_child(pitch_label)
     panel.add_child(roll_label)
 
-    panel.add_fixed(0.5 * em)
+    panel.add_fixed(0.25 * em)
     panel.add_child(o3d.visualization.gui.Label("Settings:"))
     pivot_label = o3d.visualization.gui.Label("Pivot: center")
     rot_step_label = o3d.visualization.gui.Label(f"Rot Step: {ui_state['rot_step_deg']:.1f}°")
@@ -181,7 +182,7 @@ if 'plane' in locals():
         update_scene_geometry()
 
     # Buttons
-    panel.add_fixed(em)
+    panel.add_fixed(0.4 * em)
 
     def on_reset():
         global _orig_plane_verts, _orig_plane_tris
@@ -228,7 +229,7 @@ if 'plane' in locals():
     pivot_btn.set_on_clicked(on_toggle_pivot)
     panel.add_child(pivot_btn)
 
-    step_horiz = o3d.visualization.gui.Horiz(0.5 * em)
+    step_horiz = o3d.visualization.gui.Horiz(0.2 * em)
     dec_btn = o3d.visualization.gui.Button("- Rot")
     dec_btn.set_on_clicked(on_dec_step)
     inc_btn = o3d.visualization.gui.Button("+ Rot")
@@ -237,7 +238,7 @@ if 'plane' in locals():
     step_horiz.add_child(inc_btn)
     panel.add_child(step_horiz)
 
-    trans_step_horiz = o3d.visualization.gui.Horiz(0.5 * em)
+    trans_step_horiz = o3d.visualization.gui.Horiz(0.2 * em)
     dec_trans_btn = o3d.visualization.gui.Button("- Trans")
     dec_trans_btn.set_on_clicked(on_dec_trans_step)
     inc_trans_btn = o3d.visualization.gui.Button("+ Trans")
@@ -247,11 +248,11 @@ if 'plane' in locals():
     panel.add_child(trans_step_horiz)
 
     # Translation controls
-    panel.add_fixed(em)
+    panel.add_fixed(0.4 * em)
     panel.add_child(o3d.visualization.gui.Label("Translation Controls:"))
 
     # X axis controls
-    x_horiz = o3d.visualization.gui.Horiz(0.5 * em)
+    x_horiz = o3d.visualization.gui.Horiz(0.2 * em)
     x_minus_btn = o3d.visualization.gui.Button("-X")
     x_plus_btn = o3d.visualization.gui.Button("+X")
 
@@ -270,7 +271,7 @@ if 'plane' in locals():
     panel.add_child(x_horiz)
 
     # Y axis controls
-    y_horiz = o3d.visualization.gui.Horiz(0.5 * em)
+    y_horiz = o3d.visualization.gui.Horiz(0.2 * em)
     y_minus_btn = o3d.visualization.gui.Button("-Y")
     y_plus_btn = o3d.visualization.gui.Button("+Y")
 
@@ -289,7 +290,7 @@ if 'plane' in locals():
     panel.add_child(y_horiz)
 
     # Z axis controls
-    z_horiz = o3d.visualization.gui.Horiz(0.5 * em)
+    z_horiz = o3d.visualization.gui.Horiz(0.2 * em)
     z_minus_btn = o3d.visualization.gui.Button("-Z")
     z_plus_btn = o3d.visualization.gui.Button("+Z")
 
@@ -308,11 +309,11 @@ if 'plane' in locals():
     panel.add_child(z_horiz)
 
     # Rotation controls
-    panel.add_fixed(em)
+    panel.add_fixed(0.4 * em)
     panel.add_child(o3d.visualization.gui.Label("Rotation Controls:"))
 
     # Yaw controls
-    yaw_horiz = o3d.visualization.gui.Horiz(0.5 * em)
+    yaw_horiz = o3d.visualization.gui.Horiz(0.2 * em)
     yaw_minus_btn = o3d.visualization.gui.Button("-Yaw")
     yaw_plus_btn = o3d.visualization.gui.Button("+Yaw")
 
@@ -329,7 +330,7 @@ if 'plane' in locals():
     panel.add_child(yaw_horiz)
 
     # Pitch controls
-    pitch_horiz = o3d.visualization.gui.Horiz(0.5 * em)
+    pitch_horiz = o3d.visualization.gui.Horiz(0.2 * em)
     pitch_minus_btn = o3d.visualization.gui.Button("-Pitch")
     pitch_plus_btn = o3d.visualization.gui.Button("+Pitch")
 
@@ -346,7 +347,7 @@ if 'plane' in locals():
     panel.add_child(pitch_horiz)
 
     # Roll controls
-    roll_horiz = o3d.visualization.gui.Horiz(0.5 * em)
+    roll_horiz = o3d.visualization.gui.Horiz(0.2 * em)
     roll_minus_btn = o3d.visualization.gui.Button("-Roll")
     roll_plus_btn = o3d.visualization.gui.Button("+Roll")
 
@@ -363,11 +364,11 @@ if 'plane' in locals():
     panel.add_child(roll_horiz)
 
     # Projection controls
-    panel.add_fixed(em)
+    panel.add_fixed(0.4 * em)
     panel.add_child(o3d.visualization.gui.Label("Projection:"))
 
     # Distance filter controls
-    panel.add_fixed(0.5 * em)
+    panel.add_fixed(0.25 * em)
     panel.add_child(o3d.visualization.gui.Label("Distance Filter (orthogonal):"))
 
     filter_range_label = o3d.visualization.gui.Label(
@@ -376,7 +377,7 @@ if 'plane' in locals():
     panel.add_child(filter_range_label)
 
     # Min distance input
-    min_dist_horiz = o3d.visualization.gui.Horiz(0.5 * em)
+    min_dist_horiz = o3d.visualization.gui.Horiz(0.2 * em)
     min_dist_label = o3d.visualization.gui.Label("Min:")
     min_dist_input = o3d.visualization.gui.TextEdit()
     min_dist_input.text_value = str(ui_state['filter_min_dist'])
@@ -385,7 +386,7 @@ if 'plane' in locals():
     panel.add_child(min_dist_horiz)
 
     # Max distance input
-    max_dist_horiz = o3d.visualization.gui.Horiz(0.5 * em)
+    max_dist_horiz = o3d.visualization.gui.Horiz(0.2 * em)
     max_dist_label = o3d.visualization.gui.Label("Max:")
     max_dist_input = o3d.visualization.gui.TextEdit()
     max_dist_input.text_value = str(ui_state['filter_max_dist'])
@@ -418,7 +419,7 @@ if 'plane' in locals():
     update_filter_btn.set_on_clicked(on_update_filter)
     panel.add_child(update_filter_btn)
 
-    panel.add_fixed(0.5 * em)
+    panel.add_fixed(0.25 * em)
 
     def project_points_to_plane():
         """Project 3D point cloud onto the current plane surface to create 2D occupancy map."""
