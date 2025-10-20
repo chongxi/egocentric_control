@@ -229,89 +229,302 @@ if 'plane' in locals():
     # translation step proportional to plane size, rotation step fixed
     trans_step = max(size_x, size_y) * 0.05
     rot_step_rad = np.deg2rad(5.0)
-    callbacks = _make_callbacks(plane, trans_step, rot_step_rad)
     print("Interactive controls available. Press 'H' in console for help.")
 
-    # Start a lightweight Tkinter control panel on a background thread to show pose and
-    # provide buttons. This is a simple fallback UI that runs alongside the Open3D viewer.
-    def _start_tk_panel(mesh, state):
+    # Create Open3D GUI application with integrated UI panels
+    import math
+
+    app = o3d.visualization.gui.Application.instance
+    app.initialize()
+
+    window = app.create_window("Point Cloud Viewer with Plane Control", 1400, 900)
+
+    # Shared state for plane control
+    ui_state = {
+        'pivot_is_center': True,
+        'rot_step_deg': np.rad2deg(rot_step_rad),
+        'R': np.eye(3, dtype=float),
+    }
+
+    # Create 3D scene widget
+    scene = o3d.visualization.gui.SceneWidget()
+    scene.scene = o3d.visualization.rendering.Open3DScene(window.renderer)
+
+    # Add geometries to scene
+    mat = o3d.visualization.rendering.MaterialRecord()
+    mat.shader = "defaultUnlit"
+    scene.scene.add_geometry("pcd", pcd, mat)
+
+    mat_plane = o3d.visualization.rendering.MaterialRecord()
+    mat_plane.shader = "defaultLit"
+    scene.scene.add_geometry("plane", plane, mat_plane)
+
+    # Setup camera
+    bounds = scene.scene.bounding_box
+    scene.setup_camera(60, bounds, bounds.get_center())
+
+    # Create UI panel on the right side
+    em = window.theme.font_size
+    panel_width = 20 * em
+    panel = o3d.visualization.gui.Vert(0.5 * em, o3d.visualization.gui.Margins(0.5 * em))
+
+    # Title
+    title_label = o3d.visualization.gui.Label("PLANE CONTROL PANEL")
+    panel.add_child(title_label)
+
+    # Pose information labels
+    panel.add_child(o3d.visualization.gui.Label("Position:"))
+    pos_x_label = o3d.visualization.gui.Label("X: 0.000")
+    pos_y_label = o3d.visualization.gui.Label("Y: 0.000")
+    pos_z_label = o3d.visualization.gui.Label("Z: 0.000")
+    panel.add_child(pos_x_label)
+    panel.add_child(pos_y_label)
+    panel.add_child(pos_z_label)
+
+    panel.add_fixed(0.5 * em)
+    panel.add_child(o3d.visualization.gui.Label("Rotation (deg):"))
+    yaw_label = o3d.visualization.gui.Label("Yaw:   0.0")
+    pitch_label = o3d.visualization.gui.Label("Pitch: 0.0")
+    roll_label = o3d.visualization.gui.Label("Roll:  0.0")
+    panel.add_child(yaw_label)
+    panel.add_child(pitch_label)
+    panel.add_child(roll_label)
+
+    panel.add_fixed(0.5 * em)
+    panel.add_child(o3d.visualization.gui.Label("Settings:"))
+    pivot_label = o3d.visualization.gui.Label("Pivot: center")
+    rot_step_label = o3d.visualization.gui.Label(f"Rot Step: {ui_state['rot_step_deg']:.1f}°")
+    panel.add_child(pivot_label)
+    panel.add_child(rot_step_label)
+
+    # Helper functions for transformations
+    def _euler_from_R(R: np.ndarray) -> tuple:
+        sy = -R[2, 0]
+        cy = math.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
+        yaw = math.atan2(R[1, 0], R[0, 0])
+        pitch = math.atan2(sy, cy)
+        roll = math.atan2(R[2, 1], R[2, 2])
+        return (np.rad2deg(yaw), np.rad2deg(pitch), np.rad2deg(roll))
+
+    def update_ui_labels():
         try:
-            import tkinter as tk
-            from tkinter import ttk
-        except Exception:
-            print("Tkinter not available - skipping control panel")
-            return
+            c = plane.get_center()
+            pos_x_label.text = f"X: {c[0]:7.3f}"
+            pos_y_label.text = f"Y: {c[1]:7.3f}"
+            pos_z_label.text = f"Z: {c[2]:7.3f}"
 
-        root = tk.Tk()
-        root.title("Plane Control Panel")
+            yaw, pitch, roll = _euler_from_R(ui_state['R'])
+            yaw_label.text = f"Yaw:   {yaw:6.1f}"
+            pitch_label.text = f"Pitch: {pitch:6.1f}"
+            roll_label.text = f"Roll:  {roll:6.1f}"
+        except Exception as e:
+            print(f"Error updating labels: {e}")
 
-        lbl = ttk.Label(root, text="Plane pose:\n(loading...)", justify=tk.LEFT)
-        lbl.grid(row=0, column=0, columnspan=3, padx=8, pady=8)
+    def update_scene_geometry():
+        scene.scene.remove_geometry("plane")
+        mat_plane = o3d.visualization.rendering.MaterialRecord()
+        mat_plane.shader = "defaultLit"
+        scene.scene.add_geometry("plane", plane, mat_plane)
+        update_ui_labels()
+        window.post_redraw()
 
-        def update_label():
-            try:
-                c = mesh.get_center()
-                # try to get cumulative euler if state has R
-                yaw = pitch = roll = 0.0
-                if 'R' in state:
-                    try:
-                        yaw, pitch, roll = _euler_from_R(state['R'])
-                    except Exception:
-                        pass
-                lbl.config(text=f"Plane pose:\npos=({c[0]:.3f}, {c[1]:.3f}, {c[2]:.3f})\nrot(yaw,pitch,roll)=({yaw:.1f},{pitch:.1f},{roll:.1f})\npivot={'center' if state['pivot_is_center'] else 'world'}\nrot_step={state['rot_step_deg']:.1f}deg")
-            except Exception:
-                pass
-            root.after(200, update_label)
+    def rotate_plane(axis, angle_deg):
+        center = plane.get_center() if ui_state['pivot_is_center'] else (0.0, 0.0, 0.0)
+        angle_rad = np.deg2rad(angle_deg)
+        axis_n = axis / np.linalg.norm(axis)
+        ux, uy, uz = axis_n
+        c = math.cos(angle_rad)
+        s = math.sin(angle_rad)
+        R = np.array([
+            [c + ux * ux * (1 - c), ux * uy * (1 - c) - uz * s, ux * uz * (1 - c) + uy * s],
+            [uy * ux * (1 - c) + uz * s, c + uy * uy * (1 - c), uy * uz * (1 - c) - ux * s],
+            [uz * ux * (1 - c) - uy * s, uz * uy * (1 - c) + ux * s, c + uz * uz * (1 - c)],
+        ])
+        plane.rotate(R, center=center)
+        ui_state['R'] = R @ ui_state['R']
+        update_scene_geometry()
 
-        def on_reset():
-            try:
-                global _orig_plane_verts, _orig_plane_tris
-                mesh.vertices = o3d.utility.Vector3dVector(_orig_plane_verts.copy())
-                mesh.triangles = o3d.utility.Vector3iVector(_orig_plane_tris.copy())
-                mesh.compute_vertex_normals()
-                if 'R' in state:
-                    state['R'] = np.eye(3, dtype=float)
-            except Exception:
-                pass
+    # Buttons
+    panel.add_fixed(em)
 
-        def on_toggle_pivot():
-            state['pivot_is_center'] = not state['pivot_is_center']
+    def on_reset():
+        global _orig_plane_verts, _orig_plane_tris
+        plane.vertices = o3d.utility.Vector3dVector(_orig_plane_verts.copy())
+        plane.triangles = o3d.utility.Vector3iVector(_orig_plane_tris.copy())
+        plane.compute_vertex_normals()
+        scene.scene.remove_geometry("plane")
+        mat_plane = o3d.visualization.rendering.MaterialRecord()
+        mat_plane.shader = "defaultLit"
+        scene.scene.add_geometry("plane", plane, mat_plane)
+        ui_state['R'] = np.eye(3, dtype=float)
+        window.post_redraw()
 
-        def on_inc_step():
-            state['rot_step_deg'] = min(45.0, state['rot_step_deg'] + 1.0)
+    def on_toggle_pivot():
+        ui_state['pivot_is_center'] = not ui_state['pivot_is_center']
+        pivot_label.text = f"Pivot: {'center' if ui_state['pivot_is_center'] else 'world'}"
+        window.post_redraw()
 
-        def on_dec_step():
-            state['rot_step_deg'] = max(1.0, state['rot_step_deg'] - 1.0)
+    def on_inc_step():
+        ui_state['rot_step_deg'] = min(45.0, ui_state['rot_step_deg'] + 1.0)
+        rot_step_label.text = f"Rot Step: {ui_state['rot_step_deg']:.1f}°"
+        window.post_redraw()
 
-        btn_reset = ttk.Button(root, text="Reset Plane", command=on_reset)
-        btn_reset.grid(row=1, column=0, padx=4, pady=4)
-        btn_pivot = ttk.Button(root, text="Toggle Pivot", command=on_toggle_pivot)
-        btn_pivot.grid(row=1, column=1, padx=4, pady=4)
-        btn_close = ttk.Button(root, text="Close", command=root.destroy)
-        btn_close.grid(row=1, column=2, padx=4, pady=4)
+    def on_dec_step():
+        ui_state['rot_step_deg'] = max(1.0, ui_state['rot_step_deg'] - 1.0)
+        rot_step_label.text = f"Rot Step: {ui_state['rot_step_deg']:.1f}°"
+        window.post_redraw()
 
-        btn_dec = ttk.Button(root, text="- Step", command=on_dec_step)
-        btn_dec.grid(row=2, column=0, padx=4, pady=4)
-        btn_inc = ttk.Button(root, text="+ Step", command=on_inc_step)
-        btn_inc.grid(row=2, column=1, padx=4, pady=4)
+    reset_btn = o3d.visualization.gui.Button("Reset Plane")
+    reset_btn.set_on_clicked(on_reset)
+    panel.add_child(reset_btn)
 
-        update_label()
-        root.mainloop()
+    pivot_btn = o3d.visualization.gui.Button("Toggle Pivot")
+    pivot_btn.set_on_clicked(on_toggle_pivot)
+    panel.add_child(pivot_btn)
 
-    # shared state for panel and key callbacks
-    ui_state = {'pivot_is_center': True, 'rot_step_deg': np.rad2deg(rot_step_rad), 'R': np.eye(3, dtype=float)}
-    try:
-        import threading
-        panel_thread = threading.Thread(target=_start_tk_panel, args=(plane, ui_state), daemon=True)
-        panel_thread.start()
-    except Exception:
-        print("Failed to start Tkinter control panel")
+    step_horiz = o3d.visualization.gui.Horiz(0.5 * em)
+    dec_btn = o3d.visualization.gui.Button("- Step")
+    dec_btn.set_on_clicked(on_dec_step)
+    inc_btn = o3d.visualization.gui.Button("+ Step")
+    inc_btn.set_on_clicked(on_inc_step)
+    step_horiz.add_child(dec_btn)
+    step_horiz.add_child(inc_btn)
+    panel.add_child(step_horiz)
 
-    # Merge state into keyboard callbacks by setting values after callback creation
-    # (the callbacks keep their own state dict, but we want the GUI to reflect changes too)
-    # For simplicity leave them separate; both modify the mesh directly.
+    # Translation controls
+    panel.add_fixed(em)
+    panel.add_child(o3d.visualization.gui.Label("Translation Controls:"))
 
-    o3d.visualization.draw_geometries_with_key_callbacks(geometries, callbacks)
+    # X axis controls
+    x_horiz = o3d.visualization.gui.Horiz(0.5 * em)
+    x_minus_btn = o3d.visualization.gui.Button("-X")
+    x_plus_btn = o3d.visualization.gui.Button("+X")
+
+    def on_x_minus():
+        plane.translate((-trans_step, 0.0, 0.0), relative=True)
+        update_scene_geometry()
+
+    def on_x_plus():
+        plane.translate((trans_step, 0.0, 0.0), relative=True)
+        update_scene_geometry()
+
+    x_minus_btn.set_on_clicked(on_x_minus)
+    x_plus_btn.set_on_clicked(on_x_plus)
+    x_horiz.add_child(x_minus_btn)
+    x_horiz.add_child(x_plus_btn)
+    panel.add_child(x_horiz)
+
+    # Y axis controls
+    y_horiz = o3d.visualization.gui.Horiz(0.5 * em)
+    y_minus_btn = o3d.visualization.gui.Button("-Y")
+    y_plus_btn = o3d.visualization.gui.Button("+Y")
+
+    def on_y_minus():
+        plane.translate((0.0, -trans_step, 0.0), relative=True)
+        update_scene_geometry()
+
+    def on_y_plus():
+        plane.translate((0.0, trans_step, 0.0), relative=True)
+        update_scene_geometry()
+
+    y_minus_btn.set_on_clicked(on_y_minus)
+    y_plus_btn.set_on_clicked(on_y_plus)
+    y_horiz.add_child(y_minus_btn)
+    y_horiz.add_child(y_plus_btn)
+    panel.add_child(y_horiz)
+
+    # Z axis controls
+    z_horiz = o3d.visualization.gui.Horiz(0.5 * em)
+    z_minus_btn = o3d.visualization.gui.Button("-Z")
+    z_plus_btn = o3d.visualization.gui.Button("+Z")
+
+    def on_z_minus():
+        plane.translate((0.0, 0.0, -trans_step), relative=True)
+        update_scene_geometry()
+
+    def on_z_plus():
+        plane.translate((0.0, 0.0, trans_step), relative=True)
+        update_scene_geometry()
+
+    z_minus_btn.set_on_clicked(on_z_minus)
+    z_plus_btn.set_on_clicked(on_z_plus)
+    z_horiz.add_child(z_minus_btn)
+    z_horiz.add_child(z_plus_btn)
+    panel.add_child(z_horiz)
+
+    # Rotation controls
+    panel.add_fixed(em)
+    panel.add_child(o3d.visualization.gui.Label("Rotation Controls:"))
+
+    # Yaw controls
+    yaw_horiz = o3d.visualization.gui.Horiz(0.5 * em)
+    yaw_minus_btn = o3d.visualization.gui.Button("-Yaw")
+    yaw_plus_btn = o3d.visualization.gui.Button("+Yaw")
+
+    def on_yaw_minus():
+        rotate_plane(np.array([0.0, 0.0, 1.0]), -ui_state['rot_step_deg'])
+
+    def on_yaw_plus():
+        rotate_plane(np.array([0.0, 0.0, 1.0]), ui_state['rot_step_deg'])
+
+    yaw_minus_btn.set_on_clicked(on_yaw_minus)
+    yaw_plus_btn.set_on_clicked(on_yaw_plus)
+    yaw_horiz.add_child(yaw_minus_btn)
+    yaw_horiz.add_child(yaw_plus_btn)
+    panel.add_child(yaw_horiz)
+
+    # Pitch controls
+    pitch_horiz = o3d.visualization.gui.Horiz(0.5 * em)
+    pitch_minus_btn = o3d.visualization.gui.Button("-Pitch")
+    pitch_plus_btn = o3d.visualization.gui.Button("+Pitch")
+
+    def on_pitch_minus():
+        rotate_plane(np.array([1.0, 0.0, 0.0]), -ui_state['rot_step_deg'])
+
+    def on_pitch_plus():
+        rotate_plane(np.array([1.0, 0.0, 0.0]), ui_state['rot_step_deg'])
+
+    pitch_minus_btn.set_on_clicked(on_pitch_minus)
+    pitch_plus_btn.set_on_clicked(on_pitch_plus)
+    pitch_horiz.add_child(pitch_minus_btn)
+    pitch_horiz.add_child(pitch_plus_btn)
+    panel.add_child(pitch_horiz)
+
+    # Roll controls
+    roll_horiz = o3d.visualization.gui.Horiz(0.5 * em)
+    roll_minus_btn = o3d.visualization.gui.Button("-Roll")
+    roll_plus_btn = o3d.visualization.gui.Button("+Roll")
+
+    def on_roll_minus():
+        rotate_plane(np.array([0.0, 1.0, 0.0]), -ui_state['rot_step_deg'])
+
+    def on_roll_plus():
+        rotate_plane(np.array([0.0, 1.0, 0.0]), ui_state['rot_step_deg'])
+
+    roll_minus_btn.set_on_clicked(on_roll_minus)
+    roll_plus_btn.set_on_clicked(on_roll_plus)
+    roll_horiz.add_child(roll_minus_btn)
+    roll_horiz.add_child(roll_plus_btn)
+    panel.add_child(roll_horiz)
+
+    # Layout
+    window.add_child(scene)
+    window.add_child(panel)
+
+    def on_layout(layout_context):
+        r = window.content_rect
+        scene.frame = r
+        panel_rect = o3d.visualization.gui.Rect(r.get_right() - panel_width, r.y, panel_width, r.height)
+        panel.frame = panel_rect
+
+    window.set_on_layout(on_layout)
+
+    # Initialize UI with current values
+    update_ui_labels()
+
+    # Run the application
+    app.run()
+
 else:
     o3d.visualization.draw_geometries(geometries,
                                       window_name="COLMAP Points",
