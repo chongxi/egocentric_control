@@ -29,8 +29,8 @@ if len(pcd.points) > 0:
     extent_xy = max_xy - min_xy
     # Ensure a minimum visible plane size
     min_size = 1.0
-    size_x = max(min_size, extent_xy[0] * 1.5)
-    size_y = max(min_size, extent_xy[1] * 1.5)
+    size_x = max(min_size, extent_xy[0] * 3)
+    size_y = max(min_size, extent_xy[1] * 3)
 
     # Plane will be centered at (0,0,0) in X/Y; set z plane height to 0.0
     plane_z = 0.0
