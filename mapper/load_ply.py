@@ -360,6 +360,137 @@ if 'plane' in locals():
     roll_horiz.add_child(roll_plus_btn)
     panel.add_child(roll_horiz)
 
+    # Projection controls
+    panel.add_fixed(em)
+    panel.add_child(o3d.visualization.gui.Label("Projection:"))
+
+    def project_points_to_plane():
+        """Project 3D point cloud onto the current plane surface to create 2D occupancy map."""
+        import matplotlib.pyplot as plt
+        from scipy.ndimage import binary_dilation
+
+        # Get plane vertices to compute plane normal and basis vectors
+        plane_verts = np.asarray(plane.vertices)
+
+        # Compute plane coordinate system
+        # Use two edges of the plane as basis vectors
+        v0 = plane_verts[0]
+        v1 = plane_verts[1]
+        v3 = plane_verts[3]
+
+        # Compute plane center
+        plane_center = plane.get_center()
+
+        # Basis vectors in plane
+        x_axis = v1 - v0  # along plane X
+        y_axis = v3 - v0  # along plane Y
+
+        # Normalize
+        x_axis = x_axis / np.linalg.norm(x_axis)
+        y_axis = y_axis / np.linalg.norm(y_axis)
+
+        # Plane normal (Z axis)
+        z_axis = np.cross(x_axis, y_axis)
+        z_axis = z_axis / np.linalg.norm(z_axis)
+
+        # Get point cloud points
+        points_3d = np.asarray(pcd.points)
+
+        # Project points onto plane coordinate system
+        # Transform points to plane's local coordinate system (relative to center)
+        points_relative = points_3d - plane_center
+
+        # Project onto plane's 2D coordinate system
+        points_x = np.dot(points_relative, x_axis)
+        points_y = np.dot(points_relative, y_axis)
+
+        # Compute plane dimensions
+        plane_width = np.linalg.norm(v1 - v0)
+        plane_height = np.linalg.norm(v3 - v0)
+
+        # Create occupancy map with aspect ratio matching the plane
+        # Use a base resolution and scale to maintain aspect ratio
+        base_resolution = 800
+        aspect_ratio = plane_width / plane_height
+
+        if aspect_ratio >= 1.0:
+            # Wider than tall
+            resolution_x = base_resolution
+            resolution_y = int(base_resolution / aspect_ratio)
+        else:
+            # Taller than wide
+            resolution_x = int(base_resolution * aspect_ratio)
+            resolution_y = base_resolution
+
+        occupancy_map = np.zeros((resolution_y, resolution_x), dtype=bool)
+
+        # Map points to image coordinates
+        # Normalize to [0, 1] range
+        x_normalized = (points_x + plane_width / 2) / plane_width
+        y_normalized = (points_y + plane_height / 2) / plane_height
+
+        # Convert to pixel coordinates
+        pixel_x = (x_normalized * resolution_x).astype(int)
+        pixel_y = (y_normalized * resolution_y).astype(int)
+
+        # Filter valid points (within plane bounds)
+        valid_mask = (pixel_x >= 0) & (pixel_x < resolution_x) & (pixel_y >= 0) & (pixel_y < resolution_y)
+        pixel_x = pixel_x[valid_mask]
+        pixel_y = pixel_y[valid_mask]
+
+        # Mark occupied cells
+        occupancy_map[pixel_y, pixel_x] = True
+
+        # Apply morphological dilation to make points more visible
+        occupancy_map = binary_dilation(occupancy_map, iterations=2)
+
+        # Flip Y axis for proper display (image origin is top-left)
+        occupancy_map = np.flipud(occupancy_map)
+
+        print(f"\nProjection complete!")
+        print(f"  Plane dimensions: {plane_width:.2f} x {plane_height:.2f} (aspect ratio: {aspect_ratio:.2f})")
+        print(f"  Total points: {len(points_3d)}")
+        print(f"  Projected points: {valid_mask.sum()}")
+        print(f"  Occupancy map resolution: {resolution_x}x{resolution_y} pixels")
+
+        # Create a new matplotlib window to display the occupancy map
+        from matplotlib.colors import ListedColormap
+
+        plt.figure(figsize=(10, 10))
+        ax = plt.gca()
+
+        # Display occupancy map with custom colormap
+        cmap = ListedColormap(['black', 'white'])
+        im = ax.imshow(occupancy_map, cmap=cmap, origin='upper')
+
+        ax.set_title('2D Occupancy Map - Projected Points', fontsize=14, fontweight='bold')
+        ax.set_xlabel('X axis (pixels)', fontsize=12)
+        ax.set_ylabel('Y axis (pixels)', fontsize=12)
+        ax.grid(True, alpha=0.3)
+
+        # Add colorbar
+        plt.colorbar(im, ax=ax, label='Occupied', ticks=[0, 1])
+
+        plt.tight_layout()
+        plt.show(block=False)  # Non-blocking show
+
+        print("  Close the matplotlib window when done viewing.")
+
+        return occupancy_map
+
+    def on_project():
+        try:
+            project_points_to_plane()
+            print("Occupancy map generated successfully.")
+        except Exception as e:
+            print(f"Error during projection: {e}")
+            import traceback
+            traceback.print_exc()
+
+    project_btn = o3d.visualization.gui.Button("Project to 2D Map")
+    project_btn.set_on_clicked(on_project)
+    panel.add_child(project_btn)
+
     # Layout
     window.add_child(scene)
     window.add_child(panel)
@@ -381,6 +512,6 @@ if 'plane' in locals():
 else:
     # Fallback: simple visualization without plane
     o3d.visualization.draw_geometries([pcd],
-                                      window_name="COLMAP Points",
+                                      window_name="Points",
                                       width=1024,
                                       height=768)
