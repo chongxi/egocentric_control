@@ -56,175 +56,6 @@ if len(pcd.points) > 0:
 
     print(f"\nAdded plane at x=0,y=0,z={plane_z} with size_x={size_x:.2f}, size_y={size_y:.2f}")
 
-# Visualize
-print("\nPress 'Q' to close viewer...")
-
-# Visualize both the point cloud and the plane (if created). The plane variable exists only
-# when a point cloud was loaded and the plane was created above.
-geometries = [pcd]
-if 'plane' in locals():
-    geometries.append(plane)
-
-
-def _make_callbacks(mesh, trans_step, rot_step_rad):
-    """Return a dict mapping key codes to callback functions for interactive control.
-
-    Controls:
-      I/K: move +Y / -Y
-      J/L: move -X / +X
-      U/O: move +Z / -Z
-      Q/E: rotate CCW / CW around Z (degrees)
-      R  : reset plane to origin and zero rotation
-      H  : print help
-    """
-    import math
-
-    # store initial geometry and transform information for reset
-    init_center = mesh.get_center()
-    orig_verts = None
-    try:
-        orig_verts = mesh.vertices
-    except Exception:
-        orig_verts = None
-
-    def _update(vis):
-        try:
-            mesh.compute_vertex_normals()
-        except Exception:
-            pass
-        vis.update_geometry(mesh)
-        return False
-
-    def move(dx, dy, dz):
-        def _cb(vis):
-            mesh.translate((dx, dy, dz), relative=True)
-            return _update(vis)
-        return _cb
-
-    # We'll maintain mutable state for pivot mode (center vs world origin), rotation step,
-    # and a cumulative rotation matrix for status reporting.
-    state = {
-        'pivot_is_center': True,
-        'rot_step_deg': np.rad2deg(rot_step_rad),
-        'R': np.eye(3, dtype=float),
-    }
-
-    def _get_pivot():
-        return mesh.get_center() if state['pivot_is_center'] else (0.0, 0.0, 0.0)
-
-    def rotate_axis(axis: np.ndarray, angle_rad: float):
-        def _cb(vis):
-            center = _get_pivot()
-            # Build rotation matrix using Rodrigues' formula for arbitrary axis
-            axis_n = axis / np.linalg.norm(axis)
-            ux, uy, uz = axis_n
-            c = math.cos(angle_rad)
-            s = math.sin(angle_rad)
-            R = np.array([
-                [c + ux * ux * (1 - c),     ux * uy * (1 - c) - uz * s, ux * uz * (1 - c) + uy * s],
-                [uy * ux * (1 - c) + uz * s, c + uy * uy * (1 - c),     uy * uz * (1 - c) - ux * s],
-                [uz * ux * (1 - c) - uy * s, uz * uy * (1 - c) + ux * s, c + uz * uz * (1 - c)],
-            ])
-            mesh.rotate(R, center=center)
-            # Update cumulative rotation (R_new = R * R_old)
-            state['R'] = R @ state['R']
-            print(f"Rotated around axis {axis} by {np.rad2deg(angle_rad):.1f} deg. New Euler (Z,Y,X): { _euler_from_R(state['R']) }")
-            return _update(vis)
-        return _cb
-
-    def rotate_axis_dynamic(axis: np.ndarray, angle_deg: float):
-        # angle_deg can be positive or negative; uses state['rot_step_deg'] if angle_deg==None
-        def _cb(vis):
-            a = angle_deg if angle_deg is not None else state['rot_step_deg']
-            return rotate_axis(axis, np.deg2rad(a))(vis)
-        return _cb
-
-    def _euler_from_R(R: np.ndarray) -> tuple[float, float, float]:
-        # Returns yaw(Z), pitch(Y), roll(X) in degrees using ZYX (yaw-pitch-roll)
-        sy = -R[2, 0]
-        cy = math.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
-        yaw = math.atan2(R[1, 0], R[0, 0])
-        pitch = math.atan2(sy, cy)
-        roll = math.atan2(R[2, 1], R[2, 2])
-        return (np.rad2deg(yaw), np.rad2deg(pitch), np.rad2deg(roll))
-
-    def reset_cb(vis):
-        # Restore original vertex positions exactly (undo rotations and translations)
-        try:
-            # orig verts were stored globally when plane was created
-            global _orig_plane_verts, _orig_plane_tris
-            mesh.vertices = o3d.utility.Vector3dVector(_orig_plane_verts.copy())
-            mesh.triangles = o3d.utility.Vector3iVector(_orig_plane_tris.copy())
-            mesh.compute_vertex_normals()
-            # reset cumulative rotation
-            state['R'] = np.eye(3, dtype=float)
-        except Exception:
-            # Fallback: translate to original center
-            cur_center = mesh.get_center()
-            mesh.translate((-cur_center[0], -cur_center[1], -cur_center[2]), relative=True)
-            mesh.translate((init_center[0], init_center[1], init_center[2]), relative=True)
-        return _update(vis)
-
-    def _print_status():
-        yaw, pitch, roll = _euler_from_R(state['R'])
-        print(f"\nPlane center: {mesh.get_center()}")
-        print(f"Pivot mode: {'center' if state['pivot_is_center'] else 'world origin (0,0,0)'}")
-        print(f"Rotation step (deg): {state['rot_step_deg']:.1f}")
-        print(f"Cumulative Euler (yaw, pitch, roll) in deg: ({yaw:.1f}, {pitch:.1f}, {roll:.1f})")
-
-    def help_cb(vis):
-        print("\nInteractive plane controls:")
-        print("  I/K : move +Y / -Y")
-        print("  J/L : move -X / +X")
-        print("  U/O : move +Z / -Z")
-        print("  Q/E : yaw +/- around Z (same as before)")
-        print("  Z/X : pitch +/- around X")
-        print("  C/V : roll +/- around Y")
-        print("  [   : decrease rotation step by 1 deg")
-        print("  ]   : increase rotation step by 1 deg")
-        print("  P   : toggle pivot (center <-> world origin)")
-        print("  R   : exact reset (restore original vertices)")
-        print("  H   : show this help")
-        _print_status()
-        return False
-
-    return {
-        ord('I'): move(0.0, trans_step, 0.0),
-        ord('K'): move(0.0, -trans_step, 0.0),
-        ord('J'): move(-trans_step, 0.0, 0.0),
-        ord('L'): move(trans_step, 0.0, 0.0),
-        ord('U'): move(0.0, 0.0, trans_step),
-        ord('O'): move(0.0, 0.0, -trans_step),
-        # yaw (around Z) - dynamic step
-        ord('Q'): rotate_axis_dynamic(np.array([0.0, 0.0, 1.0]), None),
-        ord('q'): rotate_axis_dynamic(np.array([0.0, 0.0, 1.0]), None),
-        ord('E'): rotate_axis_dynamic(np.array([0.0, 0.0, 1.0]), None),
-        ord('e'): rotate_axis_dynamic(np.array([0.0, 0.0, 1.0]), None),
-        # pitch (around X)
-        ord('Z'): rotate_axis_dynamic(np.array([1.0, 0.0, 0.0]), None),
-        ord('z'): rotate_axis_dynamic(np.array([1.0, 0.0, 0.0]), None),
-        ord('X'): rotate_axis_dynamic(np.array([1.0, 0.0, 0.0]), -state['rot_step_deg']),
-        ord('x'): rotate_axis_dynamic(np.array([1.0, 0.0, 0.0]), -state['rot_step_deg']),
-        # roll (around Y)
-        ord('C'): rotate_axis_dynamic(np.array([0.0, 1.0, 0.0]), None),
-        ord('c'): rotate_axis_dynamic(np.array([0.0, 1.0, 0.0]), None),
-        ord('V'): rotate_axis_dynamic(np.array([0.0, 1.0, 0.0]), -state['rot_step_deg']),
-        ord('v'): rotate_axis_dynamic(np.array([0.0, 1.0, 0.0]), -state['rot_step_deg']),
-        # large-step yaw
-        ord('G'): rotate_axis_dynamic(np.array([0.0, 0.0, 1.0]), 15.0),
-        ord('g'): rotate_axis_dynamic(np.array([0.0, 0.0, 1.0]), 15.0),
-        ord('T'): rotate_axis_dynamic(np.array([0.0, 0.0, 1.0]), -15.0),
-        ord('t'): rotate_axis_dynamic(np.array([0.0, 0.0, 1.0]), -15.0),
-        # decrease/increase rotation step
-    ord('['): (lambda vis: (state.update({'rot_step_deg': max(1.0, state['rot_step_deg'] - 1.0)}), print(f"Rotation step now {state['rot_step_deg']:.1f} deg"), False)[2]),
-    ord(']'): (lambda vis: (state.update({'rot_step_deg': min(45.0, state['rot_step_deg'] + 1.0)}), print(f"Rotation step now {state['rot_step_deg']:.1f} deg"), False)[2]),
-        # toggle pivot
-    ord('P'): (lambda vis: (state.update({'pivot_is_center': not state['pivot_is_center']}), print(f"Pivot now: {'center' if state['pivot_is_center'] else 'world origin'}"), False)[2]),
-        ord('R'): reset_cb,
-        ord('H'): help_cb,
-    }
-
-
 if 'plane' in locals():
     # translation step proportional to plane size, rotation step fixed
     trans_step = max(size_x, size_y) * 0.05
@@ -243,6 +74,7 @@ if 'plane' in locals():
     ui_state = {
         'pivot_is_center': True,
         'rot_step_deg': np.rad2deg(rot_step_rad),
+        'trans_step': trans_step,
         'R': np.eye(3, dtype=float),
     }
 
@@ -294,8 +126,10 @@ if 'plane' in locals():
     panel.add_child(o3d.visualization.gui.Label("Settings:"))
     pivot_label = o3d.visualization.gui.Label("Pivot: center")
     rot_step_label = o3d.visualization.gui.Label(f"Rot Step: {ui_state['rot_step_deg']:.1f}°")
+    trans_step_label = o3d.visualization.gui.Label(f"Trans Step: {ui_state['trans_step']:.3f}")
     panel.add_child(pivot_label)
     panel.add_child(rot_step_label)
+    panel.add_child(trans_step_label)
 
     # Helper functions for transformations
     def _euler_from_R(R: np.ndarray) -> tuple:
@@ -374,6 +208,16 @@ if 'plane' in locals():
         rot_step_label.text = f"Rot Step: {ui_state['rot_step_deg']:.1f}°"
         window.post_redraw()
 
+    def on_inc_trans_step():
+        ui_state['trans_step'] = min(1.0, ui_state['trans_step'] * 1.5)
+        trans_step_label.text = f"Trans Step: {ui_state['trans_step']:.3f}"
+        window.post_redraw()
+
+    def on_dec_trans_step():
+        ui_state['trans_step'] = max(0.001, ui_state['trans_step'] / 1.5)
+        trans_step_label.text = f"Trans Step: {ui_state['trans_step']:.3f}"
+        window.post_redraw()
+
     reset_btn = o3d.visualization.gui.Button("Reset Plane")
     reset_btn.set_on_clicked(on_reset)
     panel.add_child(reset_btn)
@@ -383,13 +227,22 @@ if 'plane' in locals():
     panel.add_child(pivot_btn)
 
     step_horiz = o3d.visualization.gui.Horiz(0.5 * em)
-    dec_btn = o3d.visualization.gui.Button("- Step")
+    dec_btn = o3d.visualization.gui.Button("- Rot")
     dec_btn.set_on_clicked(on_dec_step)
-    inc_btn = o3d.visualization.gui.Button("+ Step")
+    inc_btn = o3d.visualization.gui.Button("+ Rot")
     inc_btn.set_on_clicked(on_inc_step)
     step_horiz.add_child(dec_btn)
     step_horiz.add_child(inc_btn)
     panel.add_child(step_horiz)
+
+    trans_step_horiz = o3d.visualization.gui.Horiz(0.5 * em)
+    dec_trans_btn = o3d.visualization.gui.Button("- Trans")
+    dec_trans_btn.set_on_clicked(on_dec_trans_step)
+    inc_trans_btn = o3d.visualization.gui.Button("+ Trans")
+    inc_trans_btn.set_on_clicked(on_inc_trans_step)
+    trans_step_horiz.add_child(dec_trans_btn)
+    trans_step_horiz.add_child(inc_trans_btn)
+    panel.add_child(trans_step_horiz)
 
     # Translation controls
     panel.add_fixed(em)
@@ -401,11 +254,11 @@ if 'plane' in locals():
     x_plus_btn = o3d.visualization.gui.Button("+X")
 
     def on_x_minus():
-        plane.translate((-trans_step, 0.0, 0.0), relative=True)
+        plane.translate((-ui_state['trans_step'], 0.0, 0.0), relative=True)
         update_scene_geometry()
 
     def on_x_plus():
-        plane.translate((trans_step, 0.0, 0.0), relative=True)
+        plane.translate((ui_state['trans_step'], 0.0, 0.0), relative=True)
         update_scene_geometry()
 
     x_minus_btn.set_on_clicked(on_x_minus)
@@ -420,11 +273,11 @@ if 'plane' in locals():
     y_plus_btn = o3d.visualization.gui.Button("+Y")
 
     def on_y_minus():
-        plane.translate((0.0, -trans_step, 0.0), relative=True)
+        plane.translate((0.0, -ui_state['trans_step'], 0.0), relative=True)
         update_scene_geometry()
 
     def on_y_plus():
-        plane.translate((0.0, trans_step, 0.0), relative=True)
+        plane.translate((0.0, ui_state['trans_step'], 0.0), relative=True)
         update_scene_geometry()
 
     y_minus_btn.set_on_clicked(on_y_minus)
@@ -439,11 +292,11 @@ if 'plane' in locals():
     z_plus_btn = o3d.visualization.gui.Button("+Z")
 
     def on_z_minus():
-        plane.translate((0.0, 0.0, -trans_step), relative=True)
+        plane.translate((0.0, 0.0, -ui_state['trans_step']), relative=True)
         update_scene_geometry()
 
     def on_z_plus():
-        plane.translate((0.0, 0.0, trans_step), relative=True)
+        plane.translate((0.0, 0.0, ui_state['trans_step']), relative=True)
         update_scene_geometry()
 
     z_minus_btn.set_on_clicked(on_z_minus)
@@ -526,7 +379,8 @@ if 'plane' in locals():
     app.run()
 
 else:
-    o3d.visualization.draw_geometries(geometries,
+    # Fallback: simple visualization without plane
+    o3d.visualization.draw_geometries([pcd],
                                       window_name="COLMAP Points",
                                       width=1024,
                                       height=768)
