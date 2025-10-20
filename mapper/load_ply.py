@@ -76,6 +76,8 @@ if 'plane' in locals():
         'rot_step_deg': np.rad2deg(rot_step_rad),
         'trans_step': trans_step,
         'R': np.eye(3, dtype=float),
+        'filter_min_dist': -1.0,  # minimum orthogonal distance from plane
+        'filter_max_dist': 1.0,   # maximum orthogonal distance from plane
     }
 
     # Create 3D scene widget
@@ -364,6 +366,60 @@ if 'plane' in locals():
     panel.add_fixed(em)
     panel.add_child(o3d.visualization.gui.Label("Projection:"))
 
+    # Distance filter controls
+    panel.add_fixed(0.5 * em)
+    panel.add_child(o3d.visualization.gui.Label("Distance Filter (orthogonal):"))
+
+    filter_range_label = o3d.visualization.gui.Label(
+        f"Range: [{ui_state['filter_min_dist']:.3f}, {ui_state['filter_max_dist']:.3f}]"
+    )
+    panel.add_child(filter_range_label)
+
+    # Min distance input
+    min_dist_horiz = o3d.visualization.gui.Horiz(0.5 * em)
+    min_dist_label = o3d.visualization.gui.Label("Min:")
+    min_dist_input = o3d.visualization.gui.TextEdit()
+    min_dist_input.text_value = str(ui_state['filter_min_dist'])
+    min_dist_horiz.add_child(min_dist_label)
+    min_dist_horiz.add_child(min_dist_input)
+    panel.add_child(min_dist_horiz)
+
+    # Max distance input
+    max_dist_horiz = o3d.visualization.gui.Horiz(0.5 * em)
+    max_dist_label = o3d.visualization.gui.Label("Max:")
+    max_dist_input = o3d.visualization.gui.TextEdit()
+    max_dist_input.text_value = str(ui_state['filter_max_dist'])
+    max_dist_horiz.add_child(max_dist_label)
+    max_dist_horiz.add_child(max_dist_input)
+    panel.add_child(max_dist_horiz)
+
+    def on_update_filter():
+        """Update filter range from text inputs."""
+        try:
+            min_val = float(min_dist_input.text_value)
+            max_val = float(max_dist_input.text_value)
+
+            if min_val > max_val:
+                print(f"Warning: Min distance ({min_val}) > Max distance ({max_val}). Swapping values.")
+                min_val, max_val = max_val, min_val
+                min_dist_input.text_value = str(min_val)
+                max_dist_input.text_value = str(max_val)
+
+            ui_state['filter_min_dist'] = min_val
+            ui_state['filter_max_dist'] = max_val
+            filter_range_label.text = f"Range: [{min_val:.3f}, {max_val:.3f}]"
+            print(f"Filter range updated: [{min_val:.3f}, {max_val:.3f}]")
+            window.post_redraw()
+        except ValueError:
+            print(f"Error: Invalid number format. Please enter valid numbers.")
+            print(f"  Min: '{min_dist_input.text_value}', Max: '{max_dist_input.text_value}'")
+
+    update_filter_btn = o3d.visualization.gui.Button("Update Filter Range")
+    update_filter_btn.set_on_clicked(on_update_filter)
+    panel.add_child(update_filter_btn)
+
+    panel.add_fixed(0.5 * em)
+
     def project_points_to_plane():
         """Project 3D point cloud onto the current plane surface to create 2D occupancy map."""
         import matplotlib.pyplot as plt
@@ -400,17 +456,35 @@ if 'plane' in locals():
         # Transform points to plane's local coordinate system (relative to center)
         points_relative = points_3d - plane_center
 
+        # Calculate orthogonal distance from plane (distance along z_axis/normal)
+        orthogonal_distances = np.dot(points_relative, z_axis)
+
+        # Apply distance filter
+        min_dist = ui_state['filter_min_dist']
+        max_dist = ui_state['filter_max_dist']
+        distance_mask = (orthogonal_distances >= min_dist) & (orthogonal_distances <= max_dist)
+
+        # Filter points based on orthogonal distance
+        points_relative_filtered = points_relative[distance_mask]
+        points_3d_filtered = points_3d[distance_mask]
+
+        print(f"\nDistance filtering:")
+        print(f"  Filter range: [{min_dist:.3f}, {max_dist:.3f}]")
+        print(f"  Total points: {len(points_3d)}")
+        print(f"  Points after distance filter: {len(points_3d_filtered)} ({100 * len(points_3d_filtered) / len(points_3d):.1f}%)")
+
         # Project onto plane's 2D coordinate system
-        points_x = np.dot(points_relative, x_axis)
-        points_y = np.dot(points_relative, y_axis)
+        points_x = np.dot(points_relative_filtered, x_axis)
+        points_y = np.dot(points_relative_filtered, y_axis)
 
         # Compute plane dimensions
         plane_width = np.linalg.norm(v1 - v0)
         plane_height = np.linalg.norm(v3 - v0)
 
         # Create occupancy map with aspect ratio matching the plane
-        # Use a base resolution and scale to maintain aspect ratio
-        base_resolution = 800
+        # Use a high base resolution and scale to maintain aspect ratio
+        # Increased from 800 to 4000 for much higher detail
+        base_resolution = 4000
         aspect_ratio = plane_width / plane_height
 
         if aspect_ratio >= 1.0:
@@ -442,36 +516,59 @@ if 'plane' in locals():
         occupancy_map[pixel_y, pixel_x] = True
 
         # Apply morphological dilation to make points more visible
-        occupancy_map = binary_dilation(occupancy_map, iterations=2)
+        # Scale dilation iterations based on resolution for consistent appearance
+        dilation_iterations = max(1, int(base_resolution / 1000))
+        occupancy_map = binary_dilation(occupancy_map, iterations=dilation_iterations)
+        print(f"  Applied {dilation_iterations} dilation iterations for point visibility")
 
         # Flip Y axis for proper display (image origin is top-left)
         occupancy_map = np.flipud(occupancy_map)
 
         print(f"\nProjection complete!")
         print(f"  Plane dimensions: {plane_width:.2f} x {plane_height:.2f} (aspect ratio: {aspect_ratio:.2f})")
-        print(f"  Total points: {len(points_3d)}")
-        print(f"  Projected points: {valid_mask.sum()}")
+        print(f"  Points within distance filter: {len(points_3d_filtered)}")
+        print(f"  Projected points (within plane bounds): {valid_mask.sum()}")
         print(f"  Occupancy map resolution: {resolution_x}x{resolution_y} pixels")
 
         # Create a new matplotlib window to display the occupancy map
         from matplotlib.colors import ListedColormap
+        import os
+        from datetime import datetime
 
-        plt.figure(figsize=(10, 10))
+        # Calculate figure size based on resolution to maintain aspect ratio
+        # Use a larger figure size for better display of high-resolution images
+        fig_width = 16
+        fig_height = fig_width * (resolution_y / resolution_x)
+        fig_height = min(fig_height, 16)  # Cap height at 16 inches
+
+        plt.figure(figsize=(fig_width, fig_height), dpi=100)
         ax = plt.gca()
 
         # Display occupancy map with custom colormap
         cmap = ListedColormap(['black', 'white'])
-        im = ax.imshow(occupancy_map, cmap=cmap, origin='upper')
+        im = ax.imshow(occupancy_map, cmap=cmap, origin='upper', interpolation='nearest')
 
-        ax.set_title('2D Occupancy Map - Projected Points', fontsize=14, fontweight='bold')
+        ax.set_title(f'2D Occupancy Map - High Resolution ({resolution_x}x{resolution_y})',
+                     fontsize=14, fontweight='bold')
         ax.set_xlabel('X axis (pixels)', fontsize=12)
         ax.set_ylabel('Y axis (pixels)', fontsize=12)
-        ax.grid(True, alpha=0.3)
+        ax.grid(True, alpha=0.3, linewidth=0.5)
 
         # Add colorbar
         plt.colorbar(im, ax=ax, label='Occupied', ticks=[0, 1])
 
         plt.tight_layout()
+
+        # Save high-resolution image automatically
+        output_dir = "mapper"
+        os.makedirs(output_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = os.path.join(output_dir, f"occupancy_map_{resolution_x}x{resolution_y}_{timestamp}.png")
+
+        # Save with high DPI for maximum quality
+        plt.savefig(output_path, dpi=300, bbox_inches='tight', pad_inches=0.1)
+        print(f"  High-resolution occupancy map saved to: {output_path}")
+
         plt.show(block=False)  # Non-blocking show
 
         print("  Close the matplotlib window when done viewing.")
