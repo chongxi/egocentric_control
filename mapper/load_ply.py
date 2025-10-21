@@ -76,8 +76,8 @@ if 'plane' in locals():
         'rot_step_deg': np.rad2deg(rot_step_rad),
         'trans_step': trans_step,
         'R': np.eye(3, dtype=float),
-        'filter_min_dist': -1.0,  # minimum orthogonal distance from plane
-        'filter_max_dist': 1.0,   # maximum orthogonal distance from plane
+        'filter_min_dist': 0.05,  # minimum orthogonal distance from plane
+        'filter_max_dist': 0.3,   # maximum orthogonal distance from plane
     }
 
     # Create 3D scene widget
