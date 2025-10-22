@@ -1,0 +1,12 @@
+name: xler_py311
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy>=1.24
+  - pyyaml>=6.0
+  - scipy>=1.10
+  - matplotlib>=3.7
+  - pip
+  - pip:
+    - -r requirements.txt
