@@ -132,66 +132,47 @@ class ColmapVisualizer:
         self.images = {}
         self.point_cloud = None
         self.geometries = []
+        self.plane_fitting_camera_indices = []  # Indices of cameras used for plane fitting
 
     def load_data(self):
         """Load all COLMAP data"""
-        print("Loading COLMAP data...")
-        print("=" * 60)
-
         # Load cameras
         cameras_path = self.sparse_dir / "cameras.bin"
         if cameras_path.exists():
             self.cameras = ColmapDataLoader.read_cameras_binary(str(cameras_path))
-            print(f"✓ Loaded {len(self.cameras)} cameras")
 
         # Load images (camera poses)
         images_path = self.sparse_dir / "images.bin"
         if images_path.exists():
             self.images = ColmapDataLoader.read_images_binary(str(images_path))
-            print(f"✓ Loaded {len(self.images)} camera poses")
 
         # Load point cloud
         ply_path = self.sparse_dir / "points.ply"
         if ply_path.exists():
             self.point_cloud = o3d.io.read_point_cloud(str(ply_path))
-            num_points = len(self.point_cloud.points)
-            print(f"✓ Loaded point cloud with {num_points:,} points")
 
-            # Print detailed point cloud statistics
-            if num_points > 0:
-                points = np.asarray(self.point_cloud.points)
+        # Print summary
+        print("=" * 60)
+        print("Dataset Summary:")
+        print("-" * 60)
 
-                print("\nPoint Cloud Statistics:")
-                print("-" * 60)
+        # Point cloud count
+        num_points = len(self.point_cloud.points) if self.point_cloud else 0
+        print(f"Total points: {num_points:,}")
 
-                # X axis stats
-                x_min, x_max = points[:, 0].min(), points[:, 0].max()
-                x_range = x_max - x_min
-                print(f"X-axis: min={x_min:.4f}, max={x_max:.4f}, range={x_range:.4f}")
+        # Camera poses count
+        print(f"Camera poses: {len(self.images)}")
 
-                # Y axis stats
-                y_min, y_max = points[:, 1].min(), points[:, 1].max()
-                y_range = y_max - y_min
-                print(f"Y-axis: min={y_min:.4f}, max={y_max:.4f}, range={y_range:.4f}")
+        # XYZ ranges
+        if num_points > 0:
+            points = np.asarray(self.point_cloud.points)
+            x_min, x_max = points[:, 0].min(), points[:, 0].max()
+            y_min, y_max = points[:, 1].min(), points[:, 1].max()
+            z_min, z_max = points[:, 2].min(), points[:, 2].max()
 
-                # Z axis stats
-                z_min, z_max = points[:, 2].min(), points[:, 2].max()
-                z_range = z_max - z_min
-                print(f"Z-axis: min={z_min:.4f}, max={z_max:.4f}, range={z_range:.4f}")
-
-                # Centroid
-                centroid = points.mean(axis=0)
-                print(f"\nCentroid: [{centroid[0]:.4f}, {centroid[1]:.4f}, {centroid[2]:.4f}]")
-
-                # Bounding box volume
-                volume = x_range * y_range * z_range
-                print(f"Bounding box volume: {volume:.4f} cubic units")
-
-                # Check if colors exist
-                if self.point_cloud.has_colors():
-                    print(f"Point cloud has colors: Yes")
-                else:
-                    print(f"Point cloud has colors: No")
+            print(f"X range: [{x_min:.4f}, {x_max:.4f}]")
+            print(f"Y range: [{y_min:.4f}, {y_max:.4f}]")
+            print(f"Z range: [{z_min:.4f}, {z_max:.4f}]")
 
         print("=" * 60)
 
@@ -264,27 +245,36 @@ class ColmapVisualizer:
         C = -R.T @ t
         return C
 
-    def calculate_plane_from_3_points(self, p1: np.ndarray, p2: np.ndarray, p3: np.ndarray) -> Tuple[np.ndarray, float]:
+    def fit_plane_least_squares(self, points: np.ndarray) -> Tuple[np.ndarray, float]:
         """
-        Calculate plane equation from 3 points: ax + by + cz + d = 0
+        Fit a plane to multiple points using least-squares method
+        Plane equation: ax + by + cz + d = 0
 
         Args:
-            p1, p2, p3: Three 3D points
+            points: Nx3 array of points
 
         Returns:
             normal: Normal vector [a, b, c] (unit vector)
             d: Plane constant
         """
-        # Calculate two vectors in the plane
-        v1 = p2 - p1
-        v2 = p3 - p1
+        # Calculate centroid
+        centroid = points.mean(axis=0)
 
-        # Normal vector is cross product
-        normal = np.cross(v1, v2)
-        normal = normal / np.linalg.norm(normal)  # Normalize
+        # Center the points
+        centered = points - centroid
 
-        # Calculate d using point p1
-        d = -np.dot(normal, p1)
+        # Perform SVD
+        # The plane normal is the singular vector corresponding to the smallest singular value
+        _, _, vh = np.linalg.svd(centered)
+
+        # Normal vector is the last row of V^T (smallest singular value)
+        normal = vh[2, :]
+
+        # Normalize (should already be normalized from SVD, but just to be safe)
+        normal = normal / np.linalg.norm(normal)
+
+        # Calculate d using the centroid
+        d = -np.dot(normal, centroid)
 
         return normal, d
 
@@ -308,13 +298,14 @@ class ColmapVisualizer:
 
         return projected
 
-    def create_surface_from_pointcloud_bounds(self, color: Tuple[float, float, float] = (0.0, 0.8, 0.2)) -> o3d.geometry.TriangleMesh:
+    def create_surface_from_pointcloud_bounds(self, color: Tuple[float, float, float] = (0.0, 0.8, 0.2), percentage: float = 0.8) -> o3d.geometry.TriangleMesh:
         """
         Create a rectangular surface mesh based on the point cloud's X,Y extent,
-        lying on the plane defined by cameras 2-4 positions
+        lying on the plane fitted to a percentage of camera positions using least-squares
 
         Args:
             color: RGB color for the surface
+            percentage: Percentage of cameras to use for plane fitting (default: 0.8 = 80%)
 
         Returns:
             TriangleMesh representing the rectangular surface
@@ -323,47 +314,54 @@ class ColmapVisualizer:
             print("Warning: No point cloud available to create surface")
             return None
 
-        if len(self.images) < 4:
-            print("Warning: Need at least 4 cameras to use cameras 2-4")
+        if len(self.images) < 3:
+            print("Warning: Need at least 3 cameras for plane fitting")
             return None
 
         # Get point cloud bounds
         points = np.asarray(self.point_cloud.points)
         x_min, x_max = points[:, 0].min(), points[:, 0].max()
         y_min, y_max = points[:, 1].min(), points[:, 1].max()
-        z_min, z_max = points[:, 2].min(), points[:, 2].max()
 
-        print("\nCreating Surface:")
-        print("=" * 60)
-        print(f"Point cloud X range: [{x_min:.4f}, {x_max:.4f}]")
-        print(f"Point cloud Y range: [{y_min:.4f}, {y_max:.4f}]")
-        print(f"Point cloud Z range: [{z_min:.4f}, {z_max:.4f}]")
+        surface_width = x_max - x_min
+        surface_length = y_max - y_min
 
-        # Get cameras 2-4 (indices 1, 2, 3)
-        camera_poses_2_to_4 = list(self.images.values())[1:4]
-        camera_centers = []
+        # Calculate how many cameras to use (80% of total)
+        total_cameras = len(self.images)
+        num_cameras_to_use = max(3, int(total_cameras * percentage))  # At least 3 cameras
 
-        print("\nCameras 2-4 Positions (defining the plane):")
-        print("-" * 60)
-        for i, pose in enumerate(camera_poses_2_to_4):
+        print(f"Selecting {num_cameras_to_use} out of {total_cameras} cameras ({percentage*100:.0f}%) - excluding outliers")
+        print(f"Surface width (X): {surface_width:.4f}, length (Y): {surface_length:.4f}")
+
+        # Step 1: Get all camera centers
+        all_poses = list(self.images.values())
+        all_camera_centers = []
+        for pose in all_poses:
             center = self.get_camera_center(pose)
-            camera_centers.append(center)
-            image_name = pose.get('name', f'image_{pose["id"]}')
-            print(f"  Camera {i+2} ({image_name}): [{center[0]:.4f}, {center[1]:.4f}, {center[2]:.4f}]")
+            all_camera_centers.append(center)
+        all_camera_centers = np.array(all_camera_centers)
 
-        # Calculate plane from 3 camera positions
-        p1, p2, p3 = camera_centers[0], camera_centers[1], camera_centers[2]
-        normal, d = self.calculate_plane_from_3_points(p1, p2, p3)
+        # Step 2: Fit initial plane using all cameras
+        initial_normal, initial_d = self.fit_plane_least_squares(all_camera_centers)
 
-        print("\nPlane Equation: {:.4f}x + {:.4f}y + {:.4f}z + {:.4f} = 0".format(
-            normal[0], normal[1], normal[2], d
-        ))
+        # Step 3: Calculate distance of each camera to the initial plane
+        distances = np.abs(np.dot(all_camera_centers, initial_normal) + initial_d)
 
-        # Verify that the 3 points lie on the plane (should be ~0)
-        print("\nVerification (distance to plane, should be ~0):")
-        for i, p in enumerate(camera_centers):
-            dist = abs(np.dot(normal, p) + d)
-            print(f"  Camera {i+1} distance to plane: {dist:.6f}")
+        # Step 4: Select the cameras with smallest distances (closest to plane)
+        # Sort by distance and take the closest 80%
+        sorted_indices = np.argsort(distances)
+        selected_indices = sorted_indices[:num_cameras_to_use]
+
+        # Step 5: Get the selected camera centers
+        camera_centers = all_camera_centers[selected_indices]
+
+        # Step 6: Refit plane using only the selected cameras (non-outliers)
+        normal, d = self.fit_plane_least_squares(camera_centers)
+
+        # Store the indices of cameras used for plane fitting
+        self.plane_fitting_camera_indices = sorted(selected_indices.tolist())
+
+        print(f"Selected cameras (excluding outliers): {len(selected_indices)} cameras")
 
         # Create rectangle corners in 3D space (initially at arbitrary Z)
         # We'll use the mean Z as a starting point, then project onto the plane
@@ -404,83 +402,49 @@ class ColmapVisualizer:
         # Set color
         mesh.paint_uniform_color(color)
 
-        # Calculate actual surface dimensions and area on the plane
-        # The surface might be tilted, so we calculate actual edge lengths
-        edge1_length = np.linalg.norm(vertices[1] - vertices[0])
-        edge2_length = np.linalg.norm(vertices[3] - vertices[0])
-
-        # Calculate area using cross product for accuracy
-        v1 = vertices[1] - vertices[0]
-        v2 = vertices[3] - vertices[0]
-        area = np.linalg.norm(np.cross(v1, v2))
-
-        print("\nProjected Rectangle Corners on Plane:")
-        print("-" * 60)
-        for i, vertex in enumerate(vertices):
-            corner_names = ["Bottom-left", "Bottom-right", "Top-right", "Top-left"]
-            print(f"  {corner_names[i]}: [{vertex[0]:.4f}, {vertex[1]:.4f}, {vertex[2]:.4f}]")
-
-        print(f"\nSurface Dimensions (on the tilted plane):")
-        print(f"  Edge 1 length: {edge1_length:.4f}")
-        print(f"  Edge 2 length: {edge2_length:.4f}")
-        print(f"  Area:          {area:.4f} square units")
-
-        # Calculate tilt angle of the plane
-        z_axis = np.array([0, 0, 1])
-        angle_rad = np.arccos(np.clip(np.dot(normal, z_axis), -1.0, 1.0))
-        angle_deg = np.degrees(angle_rad)
-        print(f"\nPlane tilt from horizontal: {angle_deg:.2f} degrees")
-
-        print("=" * 60)
-
         return mesh
 
-    def create_camera_spheres(self, sphere_radius: float = 0.01) -> list:
+    def create_camera_spheres(self, sphere_radius: float = 0.01, show_every_nth: int = 1) -> list:
         """
-        Create spheres at cameras 2-4 positions to mark them
+        Create spheres at all visible camera positions to mark them
+        Cameras used for plane fitting get green color, others get yellow
 
         Args:
             sphere_radius: Radius of the spheres
+            show_every_nth: Show sphere for every nth camera (same as frustum display)
 
         Returns:
             List of sphere meshes
         """
-        if len(self.images) < 4:
-            print("Warning: Need at least 4 cameras to mark cameras 2-4")
-            return []
-
         spheres = []
-        camera_poses_2_to_4 = list(self.images.values())[1:4]
 
-        # Different colors for each sphere
-        colors = [
-            (1.0, 0.0, 0.0),  # Red - Camera 2
-            (0.0, 1.0, 0.0),  # Green - Camera 3
-            (0.0, 0.0, 1.0),  # Blue - Camera 4
-        ]
+        # Color coding:
+        # Green: Cameras used for plane fitting
+        # Yellow: Other cameras
+        plane_fitting_color = (0.0, 1.0, 0.0)  # Green - used for plane fitting
+        other_color = (1.0, 1.0, 0.0)  # Yellow - not used for plane fitting
 
-        print("\nMarking Cameras 2-4 with Spheres:")
-        print("-" * 60)
+        for idx, pose in enumerate(self.images.values()):
+            # Only create sphere for cameras matching the show_every_nth pattern
+            if idx % show_every_nth != 0:
+                continue
 
-        for i, pose in enumerate(camera_poses_2_to_4):
             center = self.get_camera_center(pose)
 
             # Create sphere
             sphere = o3d.geometry.TriangleMesh.create_sphere(radius=sphere_radius)
             sphere.translate(center)
-            sphere.paint_uniform_color(colors[i])
+
+            # Choose color based on whether it's used for plane fitting
+            if idx in self.plane_fitting_camera_indices:
+                color = plane_fitting_color
+            else:
+                color = other_color
+
+            sphere.paint_uniform_color(color)
             sphere.compute_vertex_normals()
 
             spheres.append(sphere)
-
-            # Get image name for better identification
-            image_name = pose.get('name', f'image_{pose["id"]}')
-
-            print(f"  Camera {i+2} ({image_name}):")
-            print(f"    Position: [{center[0]:.4f}, {center[1]:.4f}, {center[2]:.4f}]")
-            print(f"    Color: {'Red' if i == 0 else 'Green' if i == 1 else 'Blue'}")
-
-        print("-" * 60)
 
         return spheres
 
@@ -491,30 +455,26 @@ class ColmapVisualizer:
         Args:
             camera_scale: Scale of camera frustums
             show_every_nth: Show every nth camera (to reduce clutter)
-            show_surface: Whether to show the surface from cameras 2-4
-            show_camera_spheres: Whether to show spheres at cameras 2-4 positions
+            show_surface: Whether to show the surface fitted to 80% of cameras
+            show_camera_spheres: Whether to show spheres at all camera positions
         """
         self.geometries = []
 
         # Add point cloud
         if self.point_cloud is not None:
             self.geometries.append(self.point_cloud)
-            print(f"Added point cloud")
 
-        # Add spheres at cameras 2-4 positions
-        if show_camera_spheres and len(self.images) >= 4:
-            spheres = self.create_camera_spheres(sphere_radius=0.01)
+        # Add spheres at all camera positions (matching show_every_nth)
+        if show_camera_spheres and len(self.images) > 0:
+            spheres = self.create_camera_spheres(sphere_radius=0.01, show_every_nth=show_every_nth)
             for sphere in spheres:
                 self.geometries.append(sphere)
-            if spheres:
-                print(f"✓ Added {len(spheres)} camera position spheres (cameras 2-4)")
 
         # Add rectangular surface based on point cloud bounds
         if show_surface and self.point_cloud is not None:
             surface = self.create_surface_from_pointcloud_bounds(color=(0.0, 0.8, 0.3))
             if surface is not None:
                 self.geometries.append(surface)
-                print("✓ Added rectangular surface to visualization")
 
         # Add camera frustums
         camera_count = 0
@@ -540,8 +500,6 @@ class ColmapVisualizer:
                 self.geometries.append(frustum)
                 camera_count += 1
 
-        print(f"Added {camera_count} camera frustums")
-
         # Add coordinate frame at origin
         coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
             size=0.5, origin=[0, 0, 0]
@@ -555,18 +513,11 @@ class ColmapVisualizer:
         Args:
             camera_scale: Scale of camera frustums
             show_every_nth: Show every nth camera (1 = show all, 5 = show every 5th)
-            show_surface: Whether to show the surface from cameras 2-4
-            show_camera_spheres: Whether to show spheres at cameras 2-4 positions
+            show_surface: Whether to show the surface fitted to 80% of cameras
+            show_camera_spheres: Whether to show spheres at all camera positions
         """
         self.load_data()
         self.create_visualization(camera_scale, show_every_nth, show_surface, show_camera_spheres)
-
-        print(f"\nVisualizing {len(self.geometries)} geometries...")
-        print("Controls:")
-        print("  - Mouse: Rotate view")
-        print("  - Scroll: Zoom")
-        print("  - Ctrl+Mouse: Pan")
-        print("  - Q or ESC: Exit")
 
         o3d.visualization.draw_geometries(
             self.geometries,
@@ -598,11 +549,11 @@ def main():
     # Create visualizer
     visualizer = ColmapVisualizer(sparse_dir)
 
-    # Visualize (show every 5th camera to reduce clutter)
-    # Adjust show_every_nth based on your dataset size
-    # Set show_surface=True to display a rectangular surface matching point cloud X,Y extent
-    # Set show_camera_spheres=True to mark cameras 2-4 with colored spheres
-    visualizer.visualize(camera_scale=0.2, show_every_nth=5, show_surface=True, show_camera_spheres=True)
+    # Visualize all cameras with spheres
+    # show_every_nth=1 displays all cameras
+    # Set show_surface=True to display a rectangular surface fitted to 80% of cameras (least-squares plane)
+    # Set show_camera_spheres=True to mark all cameras with spheres (green: used for fitting, yellow: not used)
+    visualizer.visualize(camera_scale=0.2, show_every_nth=1, show_surface=True, show_camera_spheres=True)
 
 
 if __name__ == "__main__":
