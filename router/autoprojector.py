@@ -133,6 +133,8 @@ class ColmapVisualizer:
         self.point_cloud = None
         self.geometries = []
         self.plane_fitting_camera_indices = []  # Indices of cameras used for plane fitting
+        self.camera_plane_params = None  # Store camera plane (normal, d)
+        self.ground_plane_params = None  # Store ground plane (normal, d)
 
     def load_data(self):
         """Load all COLMAP data"""
@@ -415,6 +417,46 @@ class ColmapVisualizer:
 
         return np.array(coords_2d), basis_u, basis_v, origin
 
+    def calculate_plane_distance(self) -> float:
+        """
+        Calculate the distance between camera plane and ground plane
+
+        Returns:
+            Distance between the two planes (perpendicular distance)
+        """
+        if self.camera_plane_params is None or self.ground_plane_params is None:
+            return None
+
+        normal1, d1 = self.camera_plane_params
+        normal2, d2 = self.ground_plane_params
+
+        # Check if planes are parallel (dot product of normals close to 1 or -1)
+        dot_product = abs(np.dot(normal1, normal2))
+
+        if dot_product > 0.99:  # Planes are nearly parallel
+            # Distance between parallel planes: |d1 - d2| / |normal|
+            # Since normals are unit vectors, |normal| = 1
+            distance = abs(d1 - d2)
+            print(f"\nPlanes are parallel (dot product: {dot_product:.4f})")
+        else:
+            # Planes intersect - calculate distance at a reference point
+            # Use a point on plane 1 and measure distance to plane 2
+            # Find a point on plane 1: we can use any point, let's use origin if d1=0, else construct one
+            if abs(normal1[2]) > 0.1:  # Normal has significant Z component
+                # Point on plane 1: set x=0, y=0, solve for z
+                point_on_plane1 = np.array([0, 0, -d1 / normal1[2]])
+            elif abs(normal1[1]) > 0.1:  # Normal has significant Y component
+                point_on_plane1 = np.array([0, -d1 / normal1[1], 0])
+            else:  # Normal has significant X component
+                point_on_plane1 = np.array([-d1 / normal1[0], 0, 0])
+
+            # Distance from this point to plane 2
+            distance = abs(np.dot(normal2, point_on_plane1) + d2)
+            print(f"\nPlanes intersect at angle (dot product: {dot_product:.4f})")
+            print(f"Distance measured at reference point on camera plane")
+
+        return distance
+
     def create_surface_from_pointcloud_bounds(self, color: Tuple[float, float, float] = (0.0, 0.8, 0.2), percentage: float = 0.8) -> o3d.geometry.TriangleMesh:
         """
         Create a rectangular surface mesh based on the point cloud's X,Y extent,
@@ -468,6 +510,9 @@ class ColmapVisualizer:
 
         # Step 6: Refit plane using only the selected cameras (non-outliers)
         normal, d = self.fit_plane_least_squares(camera_centers)
+
+        # Store the plane parameters
+        self.camera_plane_params = (normal, d)
 
         # Store the indices of cameras used for plane fitting
         self.plane_fitting_camera_indices = sorted(selected_indices.tolist())
@@ -549,6 +594,9 @@ class ColmapVisualizer:
         if normal is None:
             print("Warning: RANSAC failed to find a plane")
             return None
+
+        # Store the ground plane parameters
+        self.ground_plane_params = (normal, d)
 
         # Get local plane coordinates to find true surface extent
         print("Projecting all points onto ground plane to determine surface size...")
@@ -672,6 +720,13 @@ class ColmapVisualizer:
             ground_plane = self.create_ground_plane_surface(color=(0.8, 0.4, 0.2), distance_threshold=0.005)
             if ground_plane is not None:
                 self.geometries.append(ground_plane)
+
+        # Calculate and print distance between the two surfaces
+        if show_surface and show_ground_plane:
+            distance = self.calculate_plane_distance()
+            if distance is not None:
+                print(f"Distance between camera plane and ground plane: {distance:.4f} units")
+                print("=" * 60)
 
         # Add camera frustums
         camera_count = 0
