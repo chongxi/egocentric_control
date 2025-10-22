@@ -127,8 +127,11 @@ class ColmapDataLoader:
 class ColmapVisualizer:
     """Visualize COLMAP reconstruction with Open3D"""
 
-    def __init__(self, sparse_dir: str, config_path: str = "router/autoprojector_conf.json"):
+    def __init__(self, sparse_dir: str, config_path: str = None):
         self.sparse_dir = Path(sparse_dir)
+        # Default config path is in the same directory as the script
+        if config_path is None:
+            config_path = Path(__file__).parent / "autoprojector_conf.json"
         self.config_path = config_path
         self.config = None
         self.cameras = {}
@@ -883,7 +886,7 @@ class ColmapVisualizer:
 
         return mask
 
-    def project_points_to_2d_grid(self, points: np.ndarray, resolution: float = 0.05) -> Tuple[np.ndarray, float, float, float, float]:
+    def project_points_to_2d_grid(self, points: np.ndarray, resolution: float = 0.05) -> Tuple[np.ndarray, float, float, float, float, np.ndarray, np.ndarray, np.ndarray]:
         """
         Project filtered 3D points onto ground plane and create 2D occupancy grid
 
@@ -894,10 +897,11 @@ class ColmapVisualizer:
         Returns:
             grid: 2D occupancy grid (0 = free, 100 = occupied)
             x_min, x_max, y_min, y_max: Bounds of the grid in world coordinates
+            basis_u, basis_v, origin: Plane coordinate frame for 3D-2D transformation
         """
         if len(points) == 0:
             print("Warning: No points to project")
-            return None, 0, 0, 0, 0
+            return None, 0, 0, 0, 0, None, None, None
 
         ground_normal, ground_d = self.ground_plane_params
 
@@ -908,7 +912,7 @@ class ColmapVisualizer:
         ])
 
         # Get 2D coordinates on the ground plane
-        coords_2d, _, _, _ = self.get_plane_local_coords(projected_points, ground_normal, ground_d)
+        coords_2d, basis_u, basis_v, origin = self.get_plane_local_coords(projected_points, ground_normal, ground_d)
 
         # Find bounds
         x_min, x_max = coords_2d[:, 0].min(), coords_2d[:, 0].max()
@@ -943,7 +947,7 @@ class ColmapVisualizer:
         total_cells = grid_width * grid_height
         print(f"  - Occupied cells: {occupied_cells:,} / {total_cells:,} ({occupied_cells/total_cells*100:.2f}%)")
 
-        return grid, x_min, x_max, y_min, y_max
+        return grid, x_min, x_max, y_min, y_max, basis_u, basis_v, origin
 
     def save_pgm(self, grid: np.ndarray, output_path: str, metadata: dict = None):
         """
@@ -995,6 +999,33 @@ class ColmapVisualizer:
             print(f"  - Metadata saved to: {yaml_path}")
             print(f"  - Real-world resolution: {metadata.get('resolution', 0.05)} m/pixel")
 
+            # Save detailed transformation parameters as NPZ for 3D-2D mapping
+            npz_path = output_path.replace('.pgm', '_transform.npz')
+            np.savez(
+                npz_path,
+                # Ground plane parameters
+                ground_plane_normal=metadata.get('ground_plane_normal'),
+                ground_plane_d=metadata.get('ground_plane_d'),
+                # Plane coordinate frame (for 3D to 2D transformation)
+                plane_basis_u=metadata.get('plane_basis_u'),
+                plane_basis_v=metadata.get('plane_basis_v'),
+                plane_origin=metadata.get('plane_origin'),
+                # Grid bounds in local plane coordinates (measured units)
+                grid_x_min=metadata.get('grid_x_min'),
+                grid_y_min=metadata.get('grid_y_min'),
+                grid_x_max=metadata.get('grid_x_max'),
+                grid_y_max=metadata.get('grid_y_max'),
+                # Resolution and scale
+                resolution_measured_units=metadata.get('resolution_measured_units'),
+                resolution_meters=metadata.get('resolution', 0.05),
+                scale_factor=metadata.get('scale_factor'),
+                # Grid dimensions
+                grid_width=metadata.get('grid_width'),
+                grid_height=metadata.get('grid_height'),
+            )
+            print(f"  - Transformation parameters saved to: {npz_path}")
+            print(f"    (Use this for 3D-2D coordinate mapping)")
+
     def generate_occupancy_map(self, output_path: str = "router/occupancy_map.pgm"):
         """
         Generate and save occupancy map from point cloud
@@ -1043,16 +1074,33 @@ class ColmapVisualizer:
         filtered_points = points[mask]
 
         # Project to 2D grid using measured units
-        grid, x_min, _, y_min, _ = self.project_points_to_2d_grid(filtered_points, resolution_measured_units)
+        grid, x_min, x_max, y_min, y_max, basis_u, basis_v, origin = self.project_points_to_2d_grid(filtered_points, resolution_measured_units)
 
-        # Save PGM with real-world metadata
+        # Get ground plane parameters
+        ground_normal, ground_d = self.ground_plane_params
+
+        # Save PGM with real-world metadata and 3D-2D transformation parameters
         metadata = {
+            # ROS standard parameters
             'resolution': target_resolution_meters,  # Real-world resolution
             'origin_x': x_min * scale_factor,  # Real-world coordinates
             'origin_y': y_min * scale_factor,
             'scale_factor': scale_factor,
             'measured_distance': measured_distance,
-            'real_distance': real_distance
+            'real_distance': real_distance,
+            # 3D-2D transformation parameters
+            'ground_plane_normal': ground_normal,
+            'ground_plane_d': ground_d,
+            'plane_basis_u': basis_u,
+            'plane_basis_v': basis_v,
+            'plane_origin': origin,
+            'grid_x_min': x_min,  # In measured units
+            'grid_y_min': y_min,
+            'grid_x_max': x_max,
+            'grid_y_max': y_max,
+            'resolution_measured_units': resolution_measured_units,
+            'grid_width': grid.shape[1],
+            'grid_height': grid.shape[0],
         }
         self.save_pgm(grid, output_path, metadata)
 
@@ -1197,21 +1245,25 @@ def main():
     """Main entry point"""
     import sys
 
-    # Default sparse directory
-    sparse_dir = "router/sparse1"
+    # Get the script directory
+    script_dir = Path(__file__).parent
+
+    # Default sparse directory (xlenav/mappipeline/sparse1/)
+    sparse_dir = script_dir / "sparse1"
 
     # Parse command line arguments
     if len(sys.argv) > 1:
-        sparse_dir = sys.argv[1]
+        sparse_dir = Path(sys.argv[1])
 
     # Check if directory exists
-    if not Path(sparse_dir).exists():
+    if not sparse_dir.exists():
         print(f"Error: Directory '{sparse_dir}' not found")
         print(f"Usage: python {sys.argv[0]} [sparse_dir]")
+        print(f"Default: {script_dir / 'sparse1'}")
         return
 
     # Create visualizer
-    visualizer = ColmapVisualizer(sparse_dir)
+    visualizer = ColmapVisualizer(str(sparse_dir))
 
     print("\n" + "="*60)
     print("COLMAP Point Cloud to Occupancy Map Pipeline")
@@ -1244,12 +1296,14 @@ def main():
 
     # Step 4: Generate occupancy map
     print("\n[Step 4/5] Generating occupancy map...")
-    output_path = "router/occupancy_map.pgm"
-    visualizer.generate_occupancy_map(output_path=output_path)
+    # Output to parent directory (xlenav/occupancy_map.pgm)
+    xlenav_dir = script_dir.parent
+    output_path = xlenav_dir / "occupancy_map.pgm"
+    visualizer.generate_occupancy_map(output_path=str(output_path))
 
     # Step 5: Preview occupancy map
     print("\n[Step 5/5] Previewing occupancy map (close window to exit)...")
-    visualizer.visualize_occupancy_map(output_path)
+    visualizer.visualize_occupancy_map(str(output_path))
 
 
 if __name__ == "__main__":
