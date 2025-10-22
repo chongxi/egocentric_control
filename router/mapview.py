@@ -367,6 +367,54 @@ class ColmapVisualizer:
 
         return projected
 
+    def get_plane_local_coords(self, points: np.ndarray, normal: np.ndarray, d: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Create a local 2D coordinate system on the plane and express points in it
+
+        Args:
+            points: Nx3 array of 3D points
+            normal: Plane normal vector
+            d: Plane constant
+
+        Returns:
+            coords_2d: Nx2 array of points in local plane coordinates
+            basis_u: First basis vector of the plane
+            basis_v: Second basis vector of the plane
+        """
+        # Project all points onto the plane first
+        projected_points = np.array([
+            self.project_point_to_plane(point, normal, d)
+            for point in points
+        ])
+
+        # Create an orthonormal basis on the plane
+        # Choose an arbitrary vector not parallel to the normal
+        if abs(normal[0]) < 0.9:
+            arbitrary = np.array([1.0, 0.0, 0.0])
+        else:
+            arbitrary = np.array([0.0, 1.0, 0.0])
+
+        # First basis vector: perpendicular to normal
+        basis_u = arbitrary - np.dot(arbitrary, normal) * normal
+        basis_u = basis_u / np.linalg.norm(basis_u)
+
+        # Second basis vector: perpendicular to both normal and basis_u
+        basis_v = np.cross(normal, basis_u)
+        basis_v = basis_v / np.linalg.norm(basis_v)
+
+        # Find a reference point on the plane (centroid of projected points)
+        origin = projected_points.mean(axis=0)
+
+        # Express each projected point in the local 2D coordinate system
+        coords_2d = []
+        for point in projected_points:
+            relative = point - origin
+            u = np.dot(relative, basis_u)
+            v = np.dot(relative, basis_v)
+            coords_2d.append([u, v])
+
+        return np.array(coords_2d), basis_u, basis_v, origin
+
     def create_surface_from_pointcloud_bounds(self, color: Tuple[float, float, float] = (0.0, 0.8, 0.2), percentage: float = 0.8) -> o3d.geometry.TriangleMesh:
         """
         Create a rectangular surface mesh based on the point cloud's X,Y extent,
@@ -387,20 +435,14 @@ class ColmapVisualizer:
             print("Warning: Need at least 3 cameras for plane fitting")
             return None
 
-        # Get point cloud bounds
+        # Get all point cloud points
         points = np.asarray(self.point_cloud.points)
-        x_min, x_max = points[:, 0].min(), points[:, 0].max()
-        y_min, y_max = points[:, 1].min(), points[:, 1].max()
-
-        surface_width = x_max - x_min
-        surface_length = y_max - y_min
 
         # Calculate how many cameras to use (80% of total)
         total_cameras = len(self.images)
         num_cameras_to_use = max(3, int(total_cameras * percentage))  # At least 3 cameras
 
         print(f"Selecting {num_cameras_to_use} out of {total_cameras} cameras ({percentage*100:.0f}%) - excluding outliers")
-        print(f"Surface width (X): {surface_width:.4f}, length (Y): {surface_length:.4f}")
 
         # Step 1: Get all camera centers
         all_poses = list(self.images.values())
@@ -432,21 +474,31 @@ class ColmapVisualizer:
 
         print(f"Selected cameras (excluding outliers): {len(selected_indices)} cameras")
 
-        # Create rectangle corners in 3D space (initially at arbitrary Z)
-        # We'll use the mean Z as a starting point, then project onto the plane
-        z_mean = np.mean([c[2] for c in camera_centers])
+        # Get local plane coordinates to find true surface extent
+        print("Projecting all points onto camera plane to determine surface size...")
+        coords_2d, basis_u, basis_v, origin = self.get_plane_local_coords(points, normal, d)
 
-        corners_initial = np.array([
-            [x_min, y_min, z_mean],  # Bottom-left
-            [x_max, y_min, z_mean],  # Bottom-right
-            [x_max, y_max, z_mean],  # Top-right
-            [x_min, y_max, z_mean],  # Top-left
+        # Find bounding box in local 2D coordinates
+        u_min, u_max = coords_2d[:, 0].min(), coords_2d[:, 0].max()
+        v_min, v_max = coords_2d[:, 1].min(), coords_2d[:, 1].max()
+
+        surface_width = u_max - u_min
+        surface_length = v_max - v_min
+
+        print(f"Camera surface width: {surface_width:.4f}, length: {surface_length:.4f} (in plane local coords)")
+
+        # Create rectangle corners in local 2D coordinates, then convert to 3D
+        corners_2d = np.array([
+            [u_min, v_min],  # Bottom-left
+            [u_max, v_min],  # Bottom-right
+            [u_max, v_max],  # Top-right
+            [u_min, v_max],  # Top-left
         ])
 
-        # Project each corner onto the plane defined by the 3 cameras
+        # Convert corners from local 2D to global 3D coordinates
         vertices = np.array([
-            self.project_point_to_plane(corner, normal, d)
-            for corner in corners_initial
+            origin + u * basis_u + v * basis_v
+            for u, v in corners_2d
         ])
 
         # Define the two triangles that make up the rectangle
@@ -498,33 +550,31 @@ class ColmapVisualizer:
             print("Warning: RANSAC failed to find a plane")
             return None
 
-        # Get inlier points to determine the extent of the ground plane
-        inlier_points = points[inlier_mask]
+        # Get local plane coordinates to find true surface extent
+        print("Projecting all points onto ground plane to determine surface size...")
+        coords_2d, basis_u, basis_v, origin = self.get_plane_local_coords(points, normal, d)
 
-        # Calculate bounding box of inliers in X,Y
-        x_min, x_max = inlier_points[:, 0].min(), inlier_points[:, 0].max()
-        y_min, y_max = inlier_points[:, 1].min(), inlier_points[:, 1].max()
+        # Find bounding box in local 2D coordinates
+        u_min, u_max = coords_2d[:, 0].min(), coords_2d[:, 0].max()
+        v_min, v_max = coords_2d[:, 1].min(), coords_2d[:, 1].max()
 
-        ground_width = x_max - x_min
-        ground_length = y_max - y_min
+        ground_width = u_max - u_min
+        ground_length = v_max - v_min
 
-        print(f"Ground plane width (X): {ground_width:.4f}, length (Y): {ground_length:.4f}")
+        print(f"Ground plane width: {ground_width:.4f}, length: {ground_length:.4f} (in plane local coords)")
 
-        # Create rectangle corners at the extent of inliers
-        # Start with corners at mean Z of inliers
-        z_mean = inlier_points[:, 2].mean()
-
-        corners_initial = np.array([
-            [x_min, y_min, z_mean],  # Bottom-left
-            [x_max, y_min, z_mean],  # Bottom-right
-            [x_max, y_max, z_mean],  # Top-right
-            [x_min, y_max, z_mean],  # Top-left
+        # Create rectangle corners in local 2D coordinates, then convert to 3D
+        corners_2d = np.array([
+            [u_min, v_min],  # Bottom-left
+            [u_max, v_min],  # Bottom-right
+            [u_max, v_max],  # Top-right
+            [u_min, v_max],  # Top-left
         ])
 
-        # Project corners onto the RANSAC-fitted plane
+        # Convert corners from local 2D to global 3D coordinates
         vertices = np.array([
-            self.project_point_to_plane(corner, normal, d)
-            for corner in corners_initial
+            origin + u * basis_u + v * basis_v
+            for u, v in corners_2d
         ])
 
         # Define triangles for the rectangle
