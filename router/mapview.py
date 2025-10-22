@@ -278,6 +278,75 @@ class ColmapVisualizer:
 
         return normal, d
 
+    def fit_plane_ransac(self, points: np.ndarray, distance_threshold: float = 0.005, max_iterations: int = 1000) -> Tuple[np.ndarray, float, np.ndarray]:
+        """
+        Fit a plane to point cloud using RANSAC to find the dominant plane (e.g., ground)
+
+        Args:
+            points: Nx3 array of points
+            distance_threshold: Maximum distance for a point to be considered an inlier (default: 0.005)
+            max_iterations: Maximum number of RANSAC iterations
+
+        Returns:
+            normal: Normal vector [a, b, c] (unit vector)
+            d: Plane constant
+            inlier_mask: Boolean mask indicating which points are inliers
+        """
+        best_inliers = None
+        best_normal = None
+        best_d = None
+        best_inlier_count = 0
+
+        n_points = len(points)
+
+        print(f"Running RANSAC plane fitting on {n_points:,} points...")
+        print(f"Distance threshold: {distance_threshold}, Max iterations: {max_iterations}")
+
+        for _ in range(max_iterations):
+            # Randomly sample 3 points
+            sample_indices = np.random.choice(n_points, 3, replace=False)
+            p1, p2, p3 = points[sample_indices]
+
+            # Calculate plane from 3 points
+            v1 = p2 - p1
+            v2 = p3 - p1
+
+            # Normal vector
+            normal = np.cross(v1, v2)
+            normal_length = np.linalg.norm(normal)
+
+            # Skip if points are collinear
+            if normal_length < 1e-6:
+                continue
+
+            normal = normal / normal_length
+            d = -np.dot(normal, p1)
+
+            # Calculate distances of all points to this plane
+            distances = np.abs(np.dot(points, normal) + d)
+
+            # Count inliers
+            inliers = distances < distance_threshold
+            inlier_count = np.sum(inliers)
+
+            # Update best plane if this one has more inliers
+            if inlier_count > best_inlier_count:
+                best_inlier_count = inlier_count
+                best_inliers = inliers
+                best_normal = normal
+                best_d = d
+
+        inlier_percentage = (best_inlier_count / n_points) * 100
+        print(f"RANSAC found plane with {best_inlier_count:,} inliers ({inlier_percentage:.2f}% of points)")
+
+        # Refine plane using all inliers with least-squares
+        if best_inlier_count > 3:
+            inlier_points = points[best_inliers]
+            best_normal, best_d = self.fit_plane_least_squares(inlier_points)
+            print(f"Refined plane using least-squares on inliers")
+
+        return best_normal, best_d, best_inliers
+
     def project_point_to_plane(self, point: np.ndarray, normal: np.ndarray, d: float) -> np.ndarray:
         """
         Project a point onto a plane
@@ -404,6 +473,77 @@ class ColmapVisualizer:
 
         return mesh
 
+    def create_ground_plane_surface(self, color: Tuple[float, float, float] = (0.8, 0.4, 0.2), distance_threshold: float = 0.005) -> o3d.geometry.TriangleMesh:
+        """
+        Create a ground plane surface using RANSAC on the point cloud
+
+        Args:
+            color: RGB color for the ground plane surface
+            distance_threshold: RANSAC distance threshold for inliers
+
+        Returns:
+            TriangleMesh representing the ground plane surface
+        """
+        if self.point_cloud is None or len(self.point_cloud.points) == 0:
+            print("Warning: No point cloud available for ground plane detection")
+            return None
+
+        # Get all points
+        points = np.asarray(self.point_cloud.points)
+
+        # Fit plane using RANSAC
+        normal, d, inlier_mask = self.fit_plane_ransac(points, distance_threshold=distance_threshold)
+
+        if normal is None:
+            print("Warning: RANSAC failed to find a plane")
+            return None
+
+        # Get inlier points to determine the extent of the ground plane
+        inlier_points = points[inlier_mask]
+
+        # Calculate bounding box of inliers in X,Y
+        x_min, x_max = inlier_points[:, 0].min(), inlier_points[:, 0].max()
+        y_min, y_max = inlier_points[:, 1].min(), inlier_points[:, 1].max()
+
+        ground_width = x_max - x_min
+        ground_length = y_max - y_min
+
+        print(f"Ground plane width (X): {ground_width:.4f}, length (Y): {ground_length:.4f}")
+
+        # Create rectangle corners at the extent of inliers
+        # Start with corners at mean Z of inliers
+        z_mean = inlier_points[:, 2].mean()
+
+        corners_initial = np.array([
+            [x_min, y_min, z_mean],  # Bottom-left
+            [x_max, y_min, z_mean],  # Bottom-right
+            [x_max, y_max, z_mean],  # Top-right
+            [x_min, y_max, z_mean],  # Top-left
+        ])
+
+        # Project corners onto the RANSAC-fitted plane
+        vertices = np.array([
+            self.project_point_to_plane(corner, normal, d)
+            for corner in corners_initial
+        ])
+
+        # Define triangles for the rectangle
+        triangles = np.array([
+            [0, 1, 2],
+            [0, 2, 1],
+            [0, 2, 3],
+            [0, 3, 2],
+        ])
+
+        # Create mesh
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(vertices)
+        mesh.triangles = o3d.utility.Vector3iVector(triangles)
+        mesh.compute_vertex_normals()
+        mesh.paint_uniform_color(color)
+
+        return mesh
+
     def create_camera_spheres(self, sphere_radius: float = 0.01, show_every_nth: int = 1) -> list:
         """
         Create spheres at all visible camera positions to mark them
@@ -448,7 +588,7 @@ class ColmapVisualizer:
 
         return spheres
 
-    def create_visualization(self, camera_scale: float = 0.2, show_every_nth: int = 1, show_surface: bool = True, show_camera_spheres: bool = True):
+    def create_visualization(self, camera_scale: float = 0.2, show_every_nth: int = 1, show_surface: bool = True, show_camera_spheres: bool = True, show_ground_plane: bool = True):
         """
         Create visualization geometries
 
@@ -457,6 +597,7 @@ class ColmapVisualizer:
             show_every_nth: Show every nth camera (to reduce clutter)
             show_surface: Whether to show the surface fitted to 80% of cameras
             show_camera_spheres: Whether to show spheres at all camera positions
+            show_ground_plane: Whether to show the RANSAC-fitted ground plane
         """
         self.geometries = []
 
@@ -470,11 +611,17 @@ class ColmapVisualizer:
             for sphere in spheres:
                 self.geometries.append(sphere)
 
-        # Add rectangular surface based on point cloud bounds
+        # Add camera-based surface (green)
         if show_surface and self.point_cloud is not None:
             surface = self.create_surface_from_pointcloud_bounds(color=(0.0, 0.8, 0.3))
             if surface is not None:
                 self.geometries.append(surface)
+
+        # Add RANSAC ground plane (orange/brown)
+        if show_ground_plane and self.point_cloud is not None:
+            ground_plane = self.create_ground_plane_surface(color=(0.8, 0.4, 0.2), distance_threshold=0.005)
+            if ground_plane is not None:
+                self.geometries.append(ground_plane)
 
         # Add camera frustums
         camera_count = 0
@@ -506,7 +653,7 @@ class ColmapVisualizer:
         )
         self.geometries.append(coord_frame)
 
-    def visualize(self, camera_scale: float = 0.2, show_every_nth: int = 1, show_surface: bool = True, show_camera_spheres: bool = True):
+    def visualize(self, camera_scale: float = 0.2, show_every_nth: int = 1, show_surface: bool = True, show_camera_spheres: bool = True, show_ground_plane: bool = True):
         """
         Visualize the COLMAP reconstruction
 
@@ -515,9 +662,10 @@ class ColmapVisualizer:
             show_every_nth: Show every nth camera (1 = show all, 5 = show every 5th)
             show_surface: Whether to show the surface fitted to 80% of cameras
             show_camera_spheres: Whether to show spheres at all camera positions
+            show_ground_plane: Whether to show the RANSAC-fitted ground plane
         """
         self.load_data()
-        self.create_visualization(camera_scale, show_every_nth, show_surface, show_camera_spheres)
+        self.create_visualization(camera_scale, show_every_nth, show_surface, show_camera_spheres, show_ground_plane)
 
         o3d.visualization.draw_geometries(
             self.geometries,
@@ -551,9 +699,10 @@ def main():
 
     # Visualize all cameras with spheres
     # show_every_nth=1 displays all cameras
-    # Set show_surface=True to display a rectangular surface fitted to 80% of cameras (least-squares plane)
+    # Set show_surface=True to display a rectangular surface fitted to 80% of cameras (green)
+    # Set show_ground_plane=True to display RANSAC-fitted ground plane from point cloud (orange/brown)
     # Set show_camera_spheres=True to mark all cameras with spheres (green: used for fitting, yellow: not used)
-    visualizer.visualize(camera_scale=0.2, show_every_nth=1, show_surface=True, show_camera_spheres=True)
+    visualizer.visualize(camera_scale=0.2, show_every_nth=1, show_surface=True, show_camera_spheres=True, show_ground_plane=True)
 
 
 if __name__ == "__main__":
