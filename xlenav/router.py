@@ -47,8 +47,15 @@ class MapRouter:
         self.map_data = self._load_map()
         self.height, self.width = self.map_data.shape
 
+        # Robot physical dimensions (width x depth in meters)
+        self.robot_width = 0.3  # meters
+        self.robot_depth = 0.2  # meters
+
         self.normalized_map = self._normalize_map()
         self.walkable = self._compute_walkable_mask()
+
+        # Create inflated walkable mask accounting for robot size
+        self.walkable_inflated = self._inflate_obstacles()
 
         self._points3d, self._colors3d = self._create_point_cloud_data()
         self.map_center = self._points3d.mean(axis=0)
@@ -102,6 +109,23 @@ class MapRouter:
         walkable = ~occupied & free
         return walkable
 
+    def _inflate_obstacles(self):
+        """Inflate obstacles by robot footprint to create safe navigation space."""
+        from scipy.ndimage import binary_erosion
+
+        # Calculate inflation radius in cells (use max of width/depth for safety)
+        inflation_radius_m = max(self.robot_width, self.robot_depth) / 2.0
+        inflation_cells = int(np.ceil(inflation_radius_m / self.resolution))
+
+        # Create circular structuring element for inflation
+        y, x = np.ogrid[-inflation_cells:inflation_cells+1, -inflation_cells:inflation_cells+1]
+        structure = x**2 + y**2 <= inflation_cells**2
+
+        # Erode the walkable mask (which inflates obstacles)
+        inflated_walkable = binary_erosion(self.walkable, structure=structure)
+
+        return inflated_walkable
+
     def world_to_grid(self, point: WorldPoint) -> GridIndex:
         x, y = point
         col_float = (x - self.origin[0]) / self.resolution
@@ -126,10 +150,11 @@ class MapRouter:
         clamped = self.clamp_cell(cell)
         if clamped is None:
             raise ValueError("Cell outside of map bounds.")
-        if self.walkable[clamped]:
+        # Use inflated walkable mask for safety
+        if self.walkable_inflated[clamped]:
             return clamped
 
-        visited = np.zeros_like(self.walkable, dtype=bool)
+        visited = np.zeros_like(self.walkable_inflated, dtype=bool)
         queue = deque([clamped])
         visited[clamped] = True
 
@@ -145,19 +170,20 @@ class MapRouter:
                 if visited[nr, nc]:
                     continue
                 visited[nr, nc] = True
-                if self.walkable[nr, nc]:
+                # Use inflated walkable mask
+                if self.walkable_inflated[nr, nc]:
                     return nr, nc
                 queue.append((nr, nc))
 
-        raise RuntimeError("No walkable cell found in the map.")
+        raise RuntimeError("No walkable cell found in the map (accounting for robot size).")
 
     def compute_default_start_goal(self) -> Tuple[WorldPoint, WorldPoint]:
         # Default start near map center
         center_cell = (self.height // 2, self.width // 2)
         start_cell = self.find_nearest_walkable(center_cell)
 
-        if not self.walkable[start_cell]:
-            raise RuntimeError("Unable to find a walkable start cell.")
+        if not self.walkable_inflated[start_cell]:
+            raise RuntimeError("Unable to find a walkable start cell (accounting for robot size).")
 
         # Goal: farthest walkable cell reachable from start
         distances = np.full((self.height, self.width), -1, dtype=np.int32)
@@ -211,10 +237,11 @@ class MapRouter:
             nr, nc = row + dr, col + dc
             if not (0 <= nr < self.height and 0 <= nc < self.width):
                 continue
-            if not self.walkable[nr, nc]:
+            # Use inflated walkable mask for path planning
+            if not self.walkable_inflated[nr, nc]:
                 continue
             if abs(dr) == 1 and abs(dc) == 1:
-                if not (self.walkable[row, nc] and self.walkable[nr, col]):
+                if not (self.walkable_inflated[row, nc] and self.walkable_inflated[nr, col]):
                     continue
             yield (nr, nc), cost
 
@@ -248,8 +275,9 @@ class MapRouter:
             goal_cell = self.clamp_cell(goal_cell)
             if start_cell is None or goal_cell is None:
                 raise ValueError("Start or goal outside of map bounds.")
-            if not self.walkable[start_cell] or not self.walkable[goal_cell]:
-                raise ValueError("Start or goal is not on a free cell.")
+            # Check inflated walkable mask for path planning safety
+            if not self.walkable_inflated[start_cell] or not self.walkable_inflated[goal_cell]:
+                raise ValueError("Start or goal is not on a free cell (accounting for robot size).")
 
         open_heap: List[Tuple[float, int, GridIndex]] = []
         counter = 0
@@ -321,6 +349,13 @@ class InteractiveRouterUI:
         self.dragging = False
         self.drag_threshold = max(self.router.resolution * 4.0, 0.1)
 
+        # Playback state
+        self.robot_speed = 0.2  # m/s
+        self.is_playing = False
+        self.robot_position = initial_route.start_world  # Current robot position
+        self.path_progress = 0.0  # Distance traveled along path
+        self.animation_timer = None
+
         display_map = np.flipud(1.0 - self.router.normalized_map)
         self.map_extent = [
             self.router.origin[0],
@@ -343,16 +378,6 @@ class InteractiveRouterUI:
         self.ax.set_aspect("equal", adjustable="box")
 
         self.path_line, = self.ax.plot([], [], color="red", linewidth=2.5, zorder=2)
-        self.start_artist = self.ax.scatter(
-            initial_route.start_world[0],
-            initial_route.start_world[1],
-            c="green",
-            s=90,
-            edgecolors="black",
-            linewidths=0.7,
-            zorder=3,
-            label="Start",
-        )
         self.goal_artist = self.ax.scatter(
             initial_route.goal_world[0],
             initial_route.goal_world[1],
@@ -364,7 +389,35 @@ class InteractiveRouterUI:
             label="Goal",
         )
 
-        self.ax.set_title("Drag the blue goal marker to update the route in real time.")
+        # Robot position as rectangle showing physical footprint
+        from matplotlib.patches import Rectangle
+        self.robot_rect = Rectangle(
+            (self.robot_position[0] - self.router.robot_width / 2,
+             self.robot_position[1] - self.router.robot_depth / 2),
+            self.router.robot_width,
+            self.router.robot_depth,
+            angle=0,
+            facecolor="orange",
+            edgecolor="black",
+            linewidth=1.5,
+            zorder=4,
+            label="Robot",
+        )
+        self.ax.add_patch(self.robot_rect)
+
+        # Robot center marker (small triangle for orientation)
+        self.robot_center_artist = self.ax.scatter(
+            self.robot_position[0],
+            self.robot_position[1],
+            c="darkred",
+            s=60,
+            marker="^",
+            edgecolors="black",
+            linewidths=0.5,
+            zorder=5,
+        )
+
+        self.ax.set_title("Interactive Path Planner - Drag goal or click Start to move robot")
         self.ax.set_xlabel("X (m)")
         self.ax.set_ylabel("Y (m)")
         self.ax.legend(loc="lower right", frameon=True)
@@ -381,6 +434,27 @@ class InteractiveRouterUI:
             bbox=dict(boxstyle="round", facecolor="black", alpha=0.5),
         )
 
+        # Add control buttons
+        from matplotlib.widgets import Button
+
+        # Adjust figure to make room for buttons
+        self.fig.subplots_adjust(bottom=0.15)
+
+        # Start button
+        ax_start = self.fig.add_axes([0.2, 0.05, 0.15, 0.05])
+        self.btn_start = Button(ax_start, 'Start')
+        self.btn_start.on_clicked(self._on_start)
+
+        # Stop button
+        ax_stop = self.fig.add_axes([0.4, 0.05, 0.15, 0.05])
+        self.btn_stop = Button(ax_stop, 'Stop')
+        self.btn_stop.on_clicked(self._on_stop)
+
+        # Reset button
+        ax_reset = self.fig.add_axes([0.6, 0.05, 0.15, 0.05])
+        self.btn_reset = Button(ax_reset, 'Reset')
+        self.btn_reset.on_clicked(self._on_reset)
+
         self.fig.canvas.mpl_connect("button_press_event", self._on_press)
         self.fig.canvas.mpl_connect("button_release_event", self._on_release)
         self.fig.canvas.mpl_connect("motion_notify_event", self._on_motion)
@@ -390,6 +464,85 @@ class InteractiveRouterUI:
 
     def run(self):
         plt.show()
+
+    def _on_start(self, _event):
+        """Start the robot movement playback."""
+        if not self.is_playing and len(self.current_route.path_world) > 1:
+            self.is_playing = True
+            if self.animation_timer is None:
+                # Start animation with ~30 FPS (33ms interval)
+                self.animation_timer = self.fig.canvas.new_timer(interval=33)
+                self.animation_timer.add_callback(self._update_animation)
+            self.animation_timer.start()
+
+    def _on_stop(self, _event):
+        """Stop the robot movement playback."""
+        if self.is_playing:
+            self.is_playing = False
+            if self.animation_timer is not None:
+                self.animation_timer.stop()
+
+    def _on_reset(self, _event):
+        """Reset the robot to the start position."""
+        self._on_stop(None)
+        self.robot_position = self.current_route.start_world
+        self.path_progress = 0.0
+        # Update robot rectangle and center marker
+        self.robot_rect.set_xy((
+            self.robot_position[0] - self.router.robot_width / 2,
+            self.robot_position[1] - self.router.robot_depth / 2
+        ))
+        self.robot_center_artist.set_offsets(np.array([self.robot_position]))
+        self.fig.canvas.draw_idle()
+
+    def _update_animation(self):
+        """Update robot position along the path."""
+        if not self.is_playing or len(self.current_route.path_world) < 2:
+            return
+
+        # Time step (33ms = 0.033s)
+        dt = 0.033
+        distance_to_move = self.robot_speed * dt
+        path = self.current_route.path_world
+
+        # Update progress
+        self.path_progress += distance_to_move
+
+        # Check if we've reached the end
+        total_path_length = self.current_route.path_length_m
+        if self.path_progress >= total_path_length:
+            # Reached the end of the path
+            self.robot_position = path[-1]
+            self.robot_artist.set_offsets(np.array([self.robot_position]))
+            self.fig.canvas.draw_idle()
+            self._on_stop(None)
+            return
+
+        # Calculate new position along the path
+        total_distance = 0.0
+        for i in range(len(path) - 1):
+            p1 = path[i]
+            p2 = path[i + 1]
+            segment_length = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+
+            if total_distance + segment_length >= self.path_progress:
+                # Robot is on this segment
+                remaining_in_segment = self.path_progress - total_distance
+                if segment_length > 0:
+                    t = remaining_in_segment / segment_length
+                    new_x = p1[0] + t * (p2[0] - p1[0])
+                    new_y = p1[1] + t * (p2[1] - p1[1])
+                    self.robot_position = (new_x, new_y)
+                break
+            total_distance += segment_length
+
+        # Update robot rectangle and center marker
+        self.robot_rect.set_xy((
+            self.robot_position[0] - self.router.robot_width / 2,
+            self.robot_position[1] - self.router.robot_depth / 2
+        ))
+        self.robot_center_artist.set_offsets(np.array([self.robot_position]))
+        self.fig.canvas.draw_idle()
 
     def _point_inside_map(self, x: float, y: float) -> bool:
         xmin, xmax = self.router.min_bounds[0], self.router.max_bounds[0]
@@ -441,16 +594,20 @@ class InteractiveRouterUI:
             return
 
         goal_world = self.router.grid_to_world(snapped_goal)
-        start_world = self.router.grid_to_world(self.start_cell)
 
+        # Plan from current robot position instead of original start
         try:
-            new_route = self.router.find_path(start_world, goal_world, snap_points=False)
+            new_route = self.router.find_path(self.robot_position, goal_world, snap_points=False)
         except (RuntimeError, ValueError):
             self._set_status("No path found to that location.", is_error=True)
             return
 
         self.current_route = new_route
         self.current_goal_cell = snapped_goal
+
+        # Keep robot at current position, reset path progress to 0
+        self.path_progress = 0.0
+
         self._update_plot(new_route)
         self._set_status(new_route)
 
@@ -462,6 +619,14 @@ class InteractiveRouterUI:
             self.path_line.set_data([], [])
 
         self.goal_artist.set_offsets(np.array([route.goal_world]))
+
+        # Update robot rectangle position
+        self.robot_rect.set_xy((
+            self.robot_position[0] - self.router.robot_width / 2,
+            self.robot_position[1] - self.router.robot_depth / 2
+        ))
+        self.robot_center_artist.set_offsets(np.array([self.robot_position]))
+
         self.fig.canvas.draw_idle()
 
     def _set_status(self, route_or_message, is_error: bool = False):
