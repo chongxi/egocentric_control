@@ -6,6 +6,7 @@ Loads and visualizes PLY point cloud and camera poses from COLMAP sparse reconst
 import numpy as np
 import open3d as o3d
 import struct
+import json
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -126,8 +127,10 @@ class ColmapDataLoader:
 class ColmapVisualizer:
     """Visualize COLMAP reconstruction with Open3D"""
 
-    def __init__(self, sparse_dir: str):
+    def __init__(self, sparse_dir: str, config_path: str = "router/autoprojector_conf.json"):
         self.sparse_dir = Path(sparse_dir)
+        self.config_path = config_path
+        self.config = None
         self.cameras = {}
         self.images = {}
         self.point_cloud = None
@@ -135,6 +138,32 @@ class ColmapVisualizer:
         self.plane_fitting_camera_indices = []  # Indices of cameras used for plane fitting
         self.camera_plane_params = None  # Store camera plane (normal, d)
         self.ground_plane_params = None  # Store ground plane (normal, d)
+
+        # Load configuration
+        self.load_config()
+
+    def load_config(self):
+        """Load configuration from JSON file"""
+        try:
+            with open(self.config_path, 'r') as f:
+                self.config = json.load(f)
+            print(f"Configuration loaded from {self.config_path}")
+            print(f"  - RANSAC threshold: {self.config.get('RANSAC_threshold', 0.005)}")
+            print(f"  - Max iterations: {self.config.get('max_iterations', 1000)}")
+            print(f"  - Camera-ground distance: {self.config.get('camera_ground_distance', 1.6)}")
+            print(f"  - Projection filter type: {self.config.get('projection_filter_type', 'camera')}")
+        except FileNotFoundError:
+            print(f"Warning: Config file {self.config_path} not found, using defaults")
+            self.config = {
+                "RANSAC_threshold": 0.005,
+                "max_iterations": 1000,
+                "camera_ground_distance": 1.6,
+                "projection_filter_type": "camera",
+                "projection_filter_params": {
+                    "camera": {"min_percent": 0.1, "max_percent": 1.0},
+                    "ceiling": {"min_percent": 0.1, "max_percent": 0.8}
+                }
+            }
 
     def load_data(self):
         """Load all COLMAP data"""
@@ -589,7 +618,7 @@ class ColmapVisualizer:
         points = np.asarray(self.point_cloud.points)
 
         # Fit plane using RANSAC
-        normal, d, inlier_mask = self.fit_plane_ransac(points, distance_threshold=distance_threshold)
+        normal, d, _ = self.fit_plane_ransac(points, distance_threshold=distance_threshold)
 
         if normal is None:
             print("Warning: RANSAC failed to find a plane")
@@ -781,6 +810,388 @@ class ColmapVisualizer:
             top=50
         )
 
+    def filter_points_by_height(self, points: np.ndarray) -> np.ndarray:
+        """
+        Filter points based on height between camera plane and ground plane
+
+        Args:
+            points: Nx3 array of 3D points
+
+        Returns:
+            Boolean mask indicating which points pass the filter
+        """
+        if self.camera_plane_params is None or self.ground_plane_params is None:
+            print("Warning: Planes not fitted yet. Returning all points.")
+            return np.ones(len(points), dtype=bool)
+
+        camera_normal, camera_d = self.camera_plane_params
+        ground_normal, ground_d = self.ground_plane_params
+
+        # Get filter parameters from config
+        filter_type = self.config.get('projection_filter_type', 'camera')
+        filter_params = self.config.get('projection_filter_params', {}).get(filter_type, {})
+        min_percent = filter_params.get('min_percent', 0.1)
+        max_percent = filter_params.get('max_percent', 1.0)
+
+        print(f"\nFiltering points using '{filter_type}' mode:")
+        print(f"  - Height range: {min_percent*100:.1f}% to {max_percent*100:.1f}%")
+
+        if filter_type == 'camera':
+            # Camera mode: filter points between camera plane and ground plane
+            # Calculate signed distance from each point to both planes
+            dist_to_ground = np.dot(points, ground_normal) + ground_d
+            dist_to_camera = np.dot(points, camera_normal) + camera_d
+
+            # Total distance between planes (use absolute values)
+            # We want points that are between the two planes
+            plane_distance = abs(np.mean(dist_to_camera) - np.mean(dist_to_ground))
+
+            # For each point, calculate its relative position between ground and camera
+            # 0 = at ground, 1 = at camera plane
+            # Use distance from ground as reference
+            relative_height = np.abs(dist_to_ground) / plane_distance
+
+            # Filter based on percentage range
+            min_height = min_percent
+            max_height = max_percent
+
+            mask = (relative_height >= min_height) & (relative_height <= max_height)
+
+        elif filter_type == 'ceiling':
+            # Ceiling mode: filter points from ground upward
+            # Calculate distance from each point to ground plane
+            dist_to_ground = np.abs(np.dot(points, ground_normal) + ground_d)
+
+            # Get max distance to define ceiling
+            max_distance = np.max(dist_to_ground)
+
+            # Calculate relative height from ground (0 = ground, 1 = highest point)
+            relative_height = dist_to_ground / max_distance
+
+            # Filter based on percentage range
+            min_height = min_percent
+            max_height = max_percent
+
+            mask = (relative_height >= min_height) & (relative_height <= max_height)
+        else:
+            print(f"Warning: Unknown filter type '{filter_type}', returning all points")
+            mask = np.ones(len(points), dtype=bool)
+
+        filtered_count = np.sum(mask)
+        total_count = len(points)
+        print(f"  - Filtered points: {filtered_count:,} / {total_count:,} ({filtered_count/total_count*100:.1f}%)")
+
+        return mask
+
+    def project_points_to_2d_grid(self, points: np.ndarray, resolution: float = 0.05) -> Tuple[np.ndarray, float, float, float, float]:
+        """
+        Project filtered 3D points onto ground plane and create 2D occupancy grid
+
+        Args:
+            points: Nx3 array of 3D points to project
+            resolution: Grid resolution in meters (default: 0.05m = 5cm per pixel)
+
+        Returns:
+            grid: 2D occupancy grid (0 = free, 100 = occupied)
+            x_min, x_max, y_min, y_max: Bounds of the grid in world coordinates
+        """
+        if len(points) == 0:
+            print("Warning: No points to project")
+            return None, 0, 0, 0, 0
+
+        ground_normal, ground_d = self.ground_plane_params
+
+        # Project all points onto ground plane
+        projected_points = np.array([
+            self.project_point_to_plane(point, ground_normal, ground_d)
+            for point in points
+        ])
+
+        # Get 2D coordinates on the ground plane
+        coords_2d, _, _, _ = self.get_plane_local_coords(projected_points, ground_normal, ground_d)
+
+        # Find bounds
+        x_min, x_max = coords_2d[:, 0].min(), coords_2d[:, 0].max()
+        y_min, y_max = coords_2d[:, 1].min(), coords_2d[:, 1].max()
+
+        print(f"\nProjecting points to 2D grid:")
+        print(f"  - Resolution: {resolution} m/pixel ({resolution*100:.1f} cm/pixel)")
+        print(f"  - X range: [{x_min:.3f}, {x_max:.3f}] ({x_max - x_min:.3f} m)")
+        print(f"  - Y range: [{y_min:.3f}, {y_max:.3f}] ({y_max - y_min:.3f} m)")
+
+        # Create grid
+        grid_width = int(np.ceil((x_max - x_min) / resolution))
+        grid_height = int(np.ceil((y_max - y_min) / resolution))
+
+        print(f"  - Grid size: {grid_width} x {grid_height} pixels")
+
+        # Initialize grid with 0 (free space)
+        grid = np.zeros((grid_height, grid_width), dtype=np.uint8)
+
+        # Map each point to grid cell and mark as occupied (100)
+        for x, y in coords_2d:
+            grid_x = int((x - x_min) / resolution)
+            grid_y = int((y - y_min) / resolution)
+
+            # Clip to grid bounds
+            grid_x = np.clip(grid_x, 0, grid_width - 1)
+            grid_y = np.clip(grid_y, 0, grid_height - 1)
+
+            grid[grid_y, grid_x] = 100  # Mark as occupied
+
+        occupied_cells = np.sum(grid == 100)
+        total_cells = grid_width * grid_height
+        print(f"  - Occupied cells: {occupied_cells:,} / {total_cells:,} ({occupied_cells/total_cells*100:.2f}%)")
+
+        return grid, x_min, x_max, y_min, y_max
+
+    def save_pgm(self, grid: np.ndarray, output_path: str, metadata: dict = None):
+        """
+        Save occupancy grid as PGM (Portable Gray Map) file
+
+        Args:
+            grid: 2D occupancy grid (values 0-255)
+            output_path: Output file path (.pgm)
+            metadata: Optional metadata dictionary to save alongside
+        """
+        if grid is None:
+            print("Warning: No grid to save")
+            return
+
+        height, width = grid.shape
+
+        # Save PGM file (binary format)
+        with open(output_path, 'wb') as f:
+            # PGM header
+            f.write(b'P5\n')  # Magic number for binary PGM
+            f.write(f'{width} {height}\n'.encode())
+            f.write(b'255\n')  # Max gray value
+
+            # Write pixel data (row by row)
+            grid.tofile(f)
+
+        print(f"\nOccupancy map saved to: {output_path}")
+        print(f"  - Format: PGM (P5 binary)")
+        print(f"  - Size: {width} x {height} pixels")
+
+        # Optionally save metadata as YAML (ROS convention)
+        if metadata:
+            yaml_path = output_path.replace('.pgm', '.yaml')
+            with open(yaml_path, 'w') as f:
+                f.write(f"image: {Path(output_path).name}\n")
+                f.write(f"resolution: {metadata.get('resolution', 0.05)}\n")
+                f.write(f"origin: [{metadata.get('origin_x', 0)}, {metadata.get('origin_y', 0)}, 0.0]\n")
+                f.write("occupied_thresh: 0.65\n")
+                f.write("free_thresh: 0.196\n")
+                f.write("negate: 0\n")
+
+                # Add calibration info as comments
+                if 'scale_factor' in metadata:
+                    f.write(f"\n# Calibration Information\n")
+                    f.write(f"# scale_factor: {metadata['scale_factor']:.6f} m/unit\n")
+                    f.write(f"# measured_distance: {metadata['measured_distance']:.6f} units\n")
+                    f.write(f"# real_distance: {metadata['real_distance']:.2f} meters\n")
+
+            print(f"  - Metadata saved to: {yaml_path}")
+            print(f"  - Real-world resolution: {metadata.get('resolution', 0.05)} m/pixel")
+
+    def generate_occupancy_map(self, output_path: str = "router/occupancy_map.pgm"):
+        """
+        Generate and save occupancy map from point cloud
+        Uses camera_ground_distance from config to calculate accurate resolution
+
+        Args:
+            output_path: Output PGM file path
+        """
+        print("\n" + "="*60)
+        print("Generating Occupancy Map")
+        print("="*60)
+
+        # Ensure data and planes are loaded
+        if self.point_cloud is None:
+            print("Error: No point cloud loaded")
+            return
+
+        if self.camera_plane_params is None or self.ground_plane_params is None:
+            print("Error: Planes not fitted. Run visualization first.")
+            return
+
+        # Calculate measured distance between planes
+        measured_distance = self.calculate_plane_distance()
+        real_distance = self.config.get('camera_ground_distance', 1.6)
+
+        # Calculate scale factor: real_world_units / measured_units
+        scale_factor = real_distance / measured_distance
+
+        print(f"\nScale Calibration:")
+        print(f"  - Measured plane distance: {measured_distance:.4f} units")
+        print(f"  - Real-world distance: {real_distance} meters")
+        print(f"  - Scale factor: {scale_factor:.4f} m/unit")
+
+        # Calculate resolution in measured units (5cm in real world)
+        target_resolution_meters = 0.05  # 5cm per pixel
+        resolution_measured_units = target_resolution_meters / scale_factor
+
+        print(f"  - Target resolution: {target_resolution_meters} m/pixel ({target_resolution_meters*100:.1f} cm/pixel)")
+        print(f"  - Resolution in measured units: {resolution_measured_units:.6f} units/pixel")
+
+        # Get all points
+        points = np.asarray(self.point_cloud.points)
+
+        # Filter points by height
+        mask = self.filter_points_by_height(points)
+        filtered_points = points[mask]
+
+        # Project to 2D grid using measured units
+        grid, x_min, _, y_min, _ = self.project_points_to_2d_grid(filtered_points, resolution_measured_units)
+
+        # Save PGM with real-world metadata
+        metadata = {
+            'resolution': target_resolution_meters,  # Real-world resolution
+            'origin_x': x_min * scale_factor,  # Real-world coordinates
+            'origin_y': y_min * scale_factor,
+            'scale_factor': scale_factor,
+            'measured_distance': measured_distance,
+            'real_distance': real_distance
+        }
+        self.save_pgm(grid, output_path, metadata)
+
+        print("="*60)
+
+        return grid
+
+    def visualize_occupancy_map(self, pgm_path: str):
+        """
+        Visualize the generated occupancy map
+
+        Args:
+            pgm_path: Path to the PGM file to visualize
+        """
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib.patches as mpatches
+        except ImportError:
+            print("Warning: matplotlib not available, skipping visualization")
+            print("Install with: pip install matplotlib")
+            return
+
+        # Read PGM file
+        try:
+            with open(pgm_path, 'rb') as f:
+                # Read header
+                magic = f.readline().strip()
+                if magic != b'P5':
+                    print(f"Error: Not a valid binary PGM file (magic: {magic})")
+                    return
+
+                # Skip comments and read dimensions
+                line = f.readline()
+                while line.startswith(b'#'):
+                    line = f.readline()
+
+                width, height = map(int, line.split())
+                _ = f.readline()  # Skip max_val line
+
+                # Read pixel data
+                grid = np.frombuffer(f.read(), dtype=np.uint8).reshape((height, width))
+
+        except Exception as e:
+            print(f"Error reading PGM file: {e}")
+            return
+
+        # Read metadata if available
+        yaml_path = pgm_path.replace('.pgm', '.yaml')
+        resolution = 0.05
+        origin_x = 0
+        origin_y = 0
+
+        try:
+            with open(yaml_path, 'r') as f:
+                for line in f:
+                    if line.startswith('resolution:'):
+                        resolution = float(line.split(':')[1].strip())
+                    elif line.startswith('origin:'):
+                        # Parse [x, y, z]
+                        coords = line.split('[')[1].split(']')[0]
+                        origin_x, origin_y = map(float, coords.split(',')[:2])
+        except FileNotFoundError:
+            print(f"Warning: Metadata file {yaml_path} not found, using defaults")
+
+        # Calculate real-world dimensions
+        map_width_m = width * resolution
+        map_height_m = height * resolution
+
+        # Create visualization
+        _, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+
+        # Left plot: Occupancy map
+        # Show map with origin at bottom-left (flip vertically)
+        im1 = ax1.imshow(grid, cmap='gray_r', origin='lower', extent=[
+            origin_x,
+            origin_x + map_width_m,
+            origin_y,
+            origin_y + map_height_m
+        ])
+
+        ax1.set_title(f'Occupancy Map\n{width}x{height} pixels @ {resolution*100:.1f}cm/pixel', fontsize=14, fontweight='bold')
+        ax1.set_xlabel(f'X (meters)\nMap width: {map_width_m:.2f}m', fontsize=11)
+        ax1.set_ylabel(f'Y (meters)\nMap height: {map_height_m:.2f}m', fontsize=11)
+        ax1.grid(True, alpha=0.3, linestyle='--')
+        ax1.set_aspect('equal')
+
+        # Add colorbar
+        cbar1 = plt.colorbar(im1, ax=ax1)
+        cbar1.set_label('Occupancy (0=Free, 100=Occupied)', fontsize=10)
+
+        # Add legend
+        free_patch = mpatches.Patch(color='white', label='Free (0)')
+        occupied_patch = mpatches.Patch(color='black', label='Occupied (100)')
+        ax1.legend(handles=[free_patch, occupied_patch], loc='upper right', fontsize=10)
+
+        # Right plot: Statistics
+        ax2.axis('off')
+        stats_text = f"""
+Occupancy Map Statistics
+{'='*40}
+
+File Information:
+  Path: {pgm_path}
+  Format: PGM (P5 Binary)
+
+Dimensions:
+  Width: {width} pixels
+  Height: {height} pixels
+  Total cells: {width * height:,}
+
+Real-World Scale:
+  Resolution: {resolution} m/pixel ({resolution*100:.1f} cm/pixel)
+  Map width: {map_width_m:.2f} meters
+  Map height: {map_height_m:.2f} meters
+  Map area: {map_width_m * map_height_m:.2f} m²
+
+Origin (bottom-left):
+  X: {origin_x:.3f} m
+  Y: {origin_y:.3f} m
+
+Occupancy Statistics:
+  Free cells: {np.sum(grid == 0):,} ({np.sum(grid == 0)/grid.size*100:.1f}%)
+  Occupied cells: {np.sum(grid == 100):,} ({np.sum(grid == 100)/grid.size*100:.1f}%)
+  Unknown cells: {np.sum((grid > 0) & (grid < 100)):,} ({np.sum((grid > 0) & (grid < 100))/grid.size*100:.1f}%)
+
+Coverage:
+  Occupied area: {np.sum(grid == 100) * resolution * resolution:.2f} m²
+  Free area: {np.sum(grid == 0) * resolution * resolution:.2f} m²
+        """
+
+        ax2.text(0.1, 0.5, stats_text, fontsize=11, family='monospace',
+                verticalalignment='center', transform=ax2.transAxes)
+
+        plt.suptitle('COLMAP Occupancy Map Visualization', fontsize=16, fontweight='bold')
+        plt.tight_layout()
+        plt.show()
+
+        print(f"\nOccupancy map visualization complete!")
+
 
 def main():
     """Main entry point"""
@@ -802,12 +1213,43 @@ def main():
     # Create visualizer
     visualizer = ColmapVisualizer(sparse_dir)
 
-    # Visualize all cameras with spheres
-    # show_every_nth=1 displays all cameras
-    # Set show_surface=True to display a rectangular surface fitted to 80% of cameras (green)
-    # Set show_ground_plane=True to display RANSAC-fitted ground plane from point cloud (orange/brown)
-    # Set show_camera_spheres=True to mark all cameras with spheres (green: used for fitting, yellow: not used)
-    visualizer.visualize(camera_scale=0.2, show_every_nth=1, show_surface=True, show_camera_spheres=True, show_ground_plane=True)
+    print("\n" + "="*60)
+    print("COLMAP Point Cloud to Occupancy Map Pipeline")
+    print("="*60)
+
+    # Step 1: Load data
+    print("\n[Step 1/5] Loading COLMAP data...")
+    visualizer.load_data()
+
+    # Step 2: Fit planes by creating visualization
+    print("\n[Step 2/5] Fitting camera and ground planes...")
+    visualizer.create_visualization(
+        camera_scale=0.2,
+        show_every_nth=1,
+        show_surface=True,
+        show_camera_spheres=True,
+        show_ground_plane=True
+    )
+
+    # Step 3: Show 3D visualization
+    print("\n[Step 3/5] Displaying 3D visualization (close window to continue)...")
+    o3d.visualization.draw_geometries(
+        visualizer.geometries,
+        window_name="COLMAP Reconstruction Viewer - Close to continue",
+        width=1280,
+        height=720,
+        left=50,
+        top=50
+    )
+
+    # Step 4: Generate occupancy map
+    print("\n[Step 4/5] Generating occupancy map...")
+    output_path = "router/occupancy_map.pgm"
+    visualizer.generate_occupancy_map(output_path=output_path)
+
+    # Step 5: Preview occupancy map
+    print("\n[Step 5/5] Previewing occupancy map (close window to exit)...")
+    visualizer.visualize_occupancy_map(output_path)
 
 
 if __name__ == "__main__":
