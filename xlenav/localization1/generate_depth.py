@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Generate monocular depth estimates for every image in the `images` folder or a
-single image file.
+single image file. Supports full-resolution outputs or a downsampled 480x800
+pipeline that also saves RGB frames.
 
 The script uses the pre-trained MiDaS DPT-Large model to infer dense depth for
 each RGB frame and stores the result as both a 16-bit PNG (for visualization or
@@ -50,6 +51,20 @@ def parse_args() -> argparse.Namespace:
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Torch device to run inference on.",
     )
+    parser.add_argument(
+        "--mode",
+        choices=["full", "downsample"],
+        default="full",
+        help="`full` keeps original resolution; `downsample` outputs 480x800 RGB/depth.",
+    )
+    parser.add_argument(
+        "--downsample-size",
+        type=int,
+        nargs=2,
+        metavar=("HEIGHT", "WIDTH"),
+        default=(480, 800),
+        help="Target size (H W) when --mode downsample is used.",
+    )
     return parser.parse_args()
 
 
@@ -83,6 +98,8 @@ def process_image(
     midas: torch.nn.Module,
     transform,
     device: str,
+    mode: str,
+    downsample_size: tuple[int, int],
 ) -> None:
     image = cv2.imread(str(image_path))
     if image is None:
@@ -101,6 +118,21 @@ def process_image(
         ).squeeze()
 
     depth = prediction.cpu().numpy()
+
+    rgb_for_save = None
+    if mode == "downsample":
+        target_h, target_w = downsample_size
+        if target_h <= 0 or target_w <= 0:
+            raise ValueError("Downsample dimensions must be positive integers.")
+        rgb_for_save = cv2.resize(
+            image, (target_w, target_h), interpolation=cv2.INTER_AREA
+        )
+        depth = cv2.resize(
+            depth,
+            (target_w, target_h),
+            interpolation=cv2.INTER_AREA,
+        )
+
     depth_uint16 = normalize_depth(depth)
 
     png_path = output_dir / f"{image_path.stem}_depth.png"
@@ -108,6 +140,9 @@ def process_image(
 
     cv2.imwrite(str(png_path), depth_uint16)
     np.savez_compressed(npz_path, depth=depth)
+    if rgb_for_save is not None:
+        rgb_path = output_dir / f"{image_path.stem}_rgb.png"
+        cv2.imwrite(str(rgb_path), rgb_for_save)
 
 
 def main() -> None:
@@ -136,9 +171,18 @@ def main() -> None:
 
     total_start = perf_counter()
     processed = 0
+    downsample_size = tuple(args.downsample_size)
     for image_path in image_paths:
         image_start = perf_counter()
-        process_image(image_path, output_dir, midas, transform, args.device)
+        process_image(
+            image_path,
+            output_dir,
+            midas,
+            transform,
+            args.device,
+            args.mode,
+            downsample_size,
+        )
         processed += 1
         print(
             f"Processed {image_path.name} in {perf_counter() - image_start:.2f}s",
