@@ -226,3 +226,5 @@ checkpoints/
 video/
 scan_20251009_155543_tum/
 scan_20251009_155543_frames/
+.venv_localization/
+xlenav/localization1/images/
