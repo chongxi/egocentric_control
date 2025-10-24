@@ -1,5 +1,6 @@
 import argparse
 import math
+import time
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Tuple
 
@@ -177,69 +178,91 @@ def nearest_neighbors(source: np.ndarray, target: np.ndarray) -> Tuple[np.ndarra
         return indices, min_distances
 
 
-def best_fit_transform(source: np.ndarray, target: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    centroid_source = np.mean(source, axis=0)
-    centroid_target = np.mean(target, axis=0)
-    centered_source = source - centroid_source
-    centered_target = target - centroid_target
-    h = centered_source.T @ centered_target
-
-    u, _, vh = np.linalg.svd(h)
-    r = vh.T @ u.T
-    if np.linalg.det(r) < 0:
-        vh[-1, :] *= -1
-        r = vh.T @ u.T
-    t = centroid_target - centroid_source @ r.T
-    return r, t
-
-
 def run_icp(
     source_points: np.ndarray,
     target_points: np.ndarray,
     max_iterations: int,
     tolerance: float,
-    rng: np.random.Generator,
+    rng: np.random.Generator,  # Unused but kept for API compatibility
 ) -> Dict[str, object]:
     if len(source_points) == 0 or len(target_points) == 0:
         raise ValueError("Cannot run ICP with empty point clouds")
 
-    source = source_points.copy()
-    target = target_points.copy()
+    try:
+        import open3d as o3d  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "Open3D is required for ICP but is not installed. Install it or run with --skip-icp."
+        ) from exc
 
-    transform = np.eye(4, dtype=np.float64)
-    prev_error = None
-    converged = False
+    start_time = time.perf_counter()
 
-    for iteration in range(1, max_iterations + 1):
-        indices, distances = nearest_neighbors(source, target)
-        matched_target = target[indices]
-        rotation, translation = best_fit_transform(source, matched_target)
+    source_cloud = o3d.geometry.PointCloud()
+    source_cloud.points = o3d.utility.Vector3dVector(source_points)
+    target_cloud = o3d.geometry.PointCloud()
+    target_cloud.points = o3d.utility.Vector3dVector(target_points)
 
-        transform_step = np.eye(4)
-        transform_step[:3, :3] = rotation
-        transform_step[:3, 3] = translation
-        transform = transform_step @ transform
+    def estimate_threshold(points_a: np.ndarray, points_b: np.ndarray) -> float:
+        def bbox_diag(points: np.ndarray) -> float:
+            if len(points) == 0:
+                return 0.0
+            extent = np.max(points, axis=0) - np.min(points, axis=0)
+            return float(np.linalg.norm(extent))
 
-        source = (source @ rotation.T) + translation
-        mean_error = float(np.mean(distances))
-        if prev_error is not None and abs(prev_error - mean_error) < tolerance:
-            converged = True
-            break
-        prev_error = mean_error
+        diag = max(bbox_diag(points_a), bbox_diag(points_b))
+        return max(1e-4, diag * 0.05)
 
-        jitter = 1e-6 * rng.standard_normal(size=source.shape)
-        source += jitter
+    distance_threshold = estimate_threshold(source_points, target_points)
+    estimation = o3d.pipelines.registration.TransformationEstimationPointToPoint()
+    criteria = o3d.pipelines.registration.ICPConvergenceCriteria(
+        max_iteration=max_iterations,
+        relative_fitness=tolerance,
+        relative_rmse=tolerance,
+    )
+
+    icp_result = o3d.pipelines.registration.registration_icp(
+        source_cloud,
+        target_cloud,
+        distance_threshold,
+        np.eye(4),
+        estimation,
+        criteria,
+    )
+
+    transform = np.asarray(icp_result.transformation, dtype=np.float64)
+    transformed_cloud = source_cloud.transform(icp_result.transformation.copy())
+    aligned_points = np.asarray(transformed_cloud.points, dtype=np.float64)
 
     residuals = compute_alignment_error(transform, source_points, target_points)
+    mean_error = residuals["mean"]
+
+    iterations = getattr(icp_result, "iteration_num", max_iterations)
+    converged = getattr(icp_result, "converged", True)
+    if isinstance(iterations, (np.ndarray, list, tuple)):
+        iterations = int(iterations[0])
+    elif iterations is None:
+        iterations = max_iterations
+    else:
+        try:
+            iterations = int(iterations)
+        except Exception:
+            iterations = max_iterations
+    if not isinstance(converged, (bool, np.bool_)):
+        converged = True
+
+    duration = time.perf_counter() - start_time
+
     return {
         "transform": transform,
-        "iterations": iteration if converged else max_iterations,
+        "iterations": iterations,
         "converged": converged,
-        "mean_error": residuals["mean"],
+        "mean_error": mean_error,
         "rmse": residuals["rmse"],
         "max_error": residuals["max"],
         "rotation_angle_deg": rotation_angle(transform[:3, :3]),
         "translation_norm": float(np.linalg.norm(transform[:3, 3])),
+        "aligned_points": aligned_points,
+        "duration_s": duration,
     }
 
 
@@ -296,7 +319,11 @@ def preview_icp_alignment(records: list[Dict[str, object]], rng: np.random.Gener
     sample_points = np.asarray(record["sample_points"], dtype=np.float64)
     reference_points = np.asarray(record["reference_points"], dtype=np.float64)
     transform = np.asarray(record["transform"], dtype=np.float64)
-    transformed_points = (sample_points @ transform[:3, :3].T) + transform[:3, 3]
+    aligned_points = record.get("aligned_points")
+    if aligned_points is not None:
+        transformed_points = np.asarray(aligned_points, dtype=np.float64)
+    else:
+        transformed_points = (sample_points @ transform[:3, :3].T) + transform[:3, 3]
 
     def make_cloud(points: np.ndarray, color: Tuple[float, float, float]) -> "o3d.geometry.PointCloud":
         cloud = o3d.geometry.PointCloud()
@@ -399,6 +426,7 @@ def main() -> None:
             print(f"- ICP max error  : {icp_result['max_error']:.6f}")
             print(f"- ICP rotation ° : {icp_result['rotation_angle_deg']:.4f}")
             print(f"- ICP translation: {icp_result['translation_norm']:.6f} (norm)")
+            print(f"- ICP time       : {icp_result['duration_s']:.4f} s")
             print("- ICP transform :\n{}".format(np.array2string(transform, formatter={"float_kind": lambda x: f"{x: .6f}"})))
             icp_records.append(
                 {
@@ -406,6 +434,10 @@ def main() -> None:
                     "sample_points": sampled_points.copy(),
                     "reference_points": sample_cache[reference_folder.name].copy(),
                     "transform": transform.copy(),
+                    "aligned_points": None
+                    if icp_result["aligned_points"] is None
+                    else np.asarray(icp_result["aligned_points"], dtype=np.float64).copy(),
+                    "duration_s": icp_result["duration_s"],
                 }
             )
         except Exception as exc:  # noqa: BLE001 - report failure but continue
